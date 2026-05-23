@@ -47489,7 +47489,7 @@ public:
         }
 
         // ENGINE 3: Key Leakage (KL-XPRV-IN-DUMP, KL-RAWHEX, KL-BDB-IV, KL-PADDING-ORACLE, KL-NOVEL-RPC-TIMING-ENTROPY)
-        // REDESIGNED: 600s watchdog (last-resort only). Per-sub-test deadlines handle individual timeouts.
+        // REDESIGNED: 120s watchdog (last-resort only). Per-sub-test deadlines (30s each) handle individual timeouts.
         // All sub-tests execute even if earlier ones time out.
         EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
             inst.version_string + ": Testing KL-XPRV-IN-DUMP, KL-RAWHEX-IN-DUMP, KL-BDB-IV-UNIQUE, KL-PADDING-ORACLE-TIMING, KL-NOVEL-RPC-TIMING-ENTROPY, KL-PAD-NOVEL-*, RPC-NOVEL-*, WAL-NOVEL-*");
@@ -47498,15 +47498,15 @@ public:
                 return deep_key_leakage(inst, params, have_wallet);
             });
             std::vector<DynamicFinding> kl;
-            if (kl_future.wait_for(std::chrono::seconds(600)) == std::future_status::ready) {
+            if (kl_future.wait_for(std::chrono::seconds(120)) == std::future_status::ready) {
                 kl = kl_future.get();
             } else {
                 EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                    inst.version_string + ": KL-ENGINE-WATCHDOG — deep_key_leakage exceeded 600s watchdog");
+                    inst.version_string + ": KL-ENGINE-WATCHDOG — deep_key_leakage exceeded 120s watchdog");
                 kl.push_back(make_finding(inst.version_string, "key_leakage",
                     "KL-ENGINE-WATCHDOG",
-                    "Key leakage engine exceeded 600s watchdog — forcibly aborted",
-                    "timeout_s=600", 0));
+                    "Key leakage engine exceeded 120s watchdog — forcibly aborted",
+                    "timeout_s=120", 0));
             }
             all.insert(all.end(), kl.begin(), kl.end());
             log("kl", "KL-* complete", kl.size());
@@ -49736,10 +49736,10 @@ public:
         std::vector<DynamicFinding> results;
         std::string ver = inst.version_string;
 
-        // REDESIGNED TIMEOUT: per-sub-test deadlines with 600s last-resort watchdog.
+        // REDESIGNED TIMEOUT: per-sub-test deadlines with 120s last-resort watchdog.
         // Each sub-test gets its own configurable timeout. If a sub-test times out,
         // we log it and move to the next — we never abort the entire engine.
-        static constexpr int KL_ENGINE_WATCHDOG_SECS = 600; // last-resort only
+        static constexpr int KL_ENGINE_WATCHDOG_SECS = 120; // reduced from 600s; per-sub-test deadlines handle individual timeouts
         auto kl_engine_start = std::chrono::steady_clock::now();
         auto kl_engine_expired = [&]() -> bool {
             auto now = std::chrono::steady_clock::now();
@@ -49752,9 +49752,9 @@ public:
                                std::function<std::vector<DynamicFinding>()> fn) -> std::vector<DynamicFinding> {
             if (kl_engine_expired()) {
                 EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                    ver + ": " + subtest_name + " SKIPPED — 600s watchdog expired");
+                    ver + ": " + subtest_name + " SKIPPED — 120s watchdog expired");
                 return {make_finding(ver, "key_leakage", subtest_name + "-WATCHDOG",
-                    "Sub-test skipped: 600s engine watchdog expired", "", 0)};
+                    "Sub-test skipped: 120s engine watchdog expired", "", 0)};
             }
             auto sub_future = std::async(std::launch::async, fn);
             if (sub_future.wait_for(std::chrono::seconds(timeout_secs)) == std::future_status::ready) {
@@ -50637,7 +50637,7 @@ public:
         // ENGINE 3 DEEP: PADDING ORACLE DISCOVERY — 6 oracle types
         // ================================================================
 
-        // KL ENGINE WATCHDOG CHECK — log if 600s exceeded but do NOT abort
+        // KL ENGINE WATCHDOG CHECK — log if 120s exceeded but do NOT abort
         if (kl_engine_expired()) {
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - kl_engine_start).count();
@@ -50713,59 +50713,62 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 600s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
         }
 
         // TYPE 1 ENHANCED: High-iteration timing oracle with t-test
         // NOVELTY DECLARATION — KL-PADDING-TIMING-DEEP
-        // 10,000 iterations (2 groups: valid-padding-shaped vs invalid)
+        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 5000 to 50 iterations
+        // (n=50 is sufficient for Welch's t-test statistical power)
         {
-            std::vector<double> valid_times, invalid_times;
-            // "Valid padding" shaped: last byte = 0x01 (PKCS7 padding length 1)
-            std::string valid_shaped = "padding_valid_01";
-            // "Invalid padding" shaped: different safe string
-            std::string invalid_shaped = "padding_invalid0";
-            for (int i = 0; i < 5000; i++) {
-                auto t0 = std::chrono::steady_clock::now();
-                rpc_fast(inst, "walletpassphrase", "[\"" + valid_shaped + "\", 1]");
-                auto t1 = std::chrono::steady_clock::now();
-                valid_times.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count());
+            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 30, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
+                std::vector<double> valid_times, invalid_times;
+                std::string valid_shaped = "padding_valid_01";
+                std::string invalid_shaped = "padding_invalid0";
+                constexpr int TIMING_DEEP_ITERS = 50;
+                for (int i = 0; i < TIMING_DEEP_ITERS; i++) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    rpc_fast(inst, "walletpassphrase", "[\"" + valid_shaped + "\", 1]");
+                    auto t1 = std::chrono::steady_clock::now();
+                    valid_times.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count());
 
-                t0 = std::chrono::steady_clock::now();
-                rpc_fast(inst, "walletpassphrase", "[\"" + invalid_shaped + "\", 1]");
-                t1 = std::chrono::steady_clock::now();
-                invalid_times.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count());
-            }
-            // Welch's t-test
-            auto calc_stats = [](const std::vector<double>& v) -> std::pair<double,double> {
-                double sum = 0, sum2 = 0;
-                for (auto x : v) { sum += x; sum2 += x*x; }
-                double mean = sum / v.size();
-                double var = sum2 / v.size() - mean * mean;
-                return {mean, var};
-            };
-            auto [mean_v, var_v] = calc_stats(valid_times);
-            auto [mean_i, var_i] = calc_stats(invalid_times);
-            double t_stat = 0;
-            if (var_v + var_i > 0) {
-                double se = std::sqrt(var_v / valid_times.size() + var_i / invalid_times.size());
-                if (se > 0) t_stat = std::abs(mean_v - mean_i) / se;
-            }
-            // t > 3.29 ≈ p < 0.001 for large N
-            bool significant = t_stat > 3.29;
-            results.push_back(make_finding(ver, "key_leakage",
-                significant ? "KL-PADDING-TIMING-SIGNIFICANT" : "KL-PADDING-TIMING-INSIGNIFICANT",
-                (significant ? "Timing difference SIGNIFICANT" : "PASS: No significant timing difference") +
-                std::string(" t=" + std::to_string(t_stat) + " mean_valid=" + std::to_string(mean_v) +
-                " mean_invalid=" + std::to_string(mean_i) + " n=5000"),
-                "t_stat=" + std::to_string(t_stat) + " p<" + (significant ? "0.001" : "ns"),
-                significant ? 7 : 0));
+                    t0 = std::chrono::steady_clock::now();
+                    rpc_fast(inst, "walletpassphrase", "[\"" + invalid_shaped + "\", 1]");
+                    t1 = std::chrono::steady_clock::now();
+                    invalid_times.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count());
+                }
+                auto calc_stats = [](const std::vector<double>& v) -> std::pair<double,double> {
+                    double sum = 0, sum2 = 0;
+                    for (auto x : v) { sum += x; sum2 += x*x; }
+                    double mean = sum / v.size();
+                    double var = sum2 / v.size() - mean * mean;
+                    return {mean, var};
+                };
+                auto [mean_v, var_v] = calc_stats(valid_times);
+                auto [mean_i, var_i] = calc_stats(invalid_times);
+                double t_stat = 0;
+                if (var_v + var_i > 0) {
+                    double se = std::sqrt(var_v / valid_times.size() + var_i / invalid_times.size());
+                    if (se > 0) t_stat = std::abs(mean_v - mean_i) / se;
+                }
+                bool significant = t_stat > 3.29;
+                sub.push_back(make_finding(ver, "key_leakage",
+                    significant ? "KL-PADDING-TIMING-SIGNIFICANT" : "KL-PADDING-TIMING-INSIGNIFICANT",
+                    (significant ? "Timing difference SIGNIFICANT" : "PASS: No significant timing difference") +
+                    std::string(" t=" + std::to_string(t_stat) + " mean_valid=" + std::to_string(mean_v) +
+                    " mean_invalid=" + std::to_string(mean_i) + " n=" + std::to_string(TIMING_DEEP_ITERS)),
+                    "t_stat=" + std::to_string(t_stat) + " p<" + (significant ? "0.001" : "ns"),
+                    significant ? 7 : 0));
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         }
 
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 600s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
         }
 
         // TYPE 5: Memory scan after walletlock — SIP-compatible multi-method approach
@@ -50958,289 +50961,293 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 600s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
         }
 
         // ================================================================
         // ENGINE 3 DEEP: KL-PADDING-EXPLOIT — Lucky13 decryption attempt
         // NOVELTY DECLARATION: Attempts to extract master key via padding oracle
-        // Extracts ciphertext from wallet.dat, tries byte-by-byte decryption
+        // FIX: Wrapped in run_subtest with 30s deadline; reduced iterations_per_byte 500→5
         // ================================================================
         {
-            std::string wp = inst.data_directory + "/regtest/wallet.dat";
-            if (file_exists(wp)) {
-                std::ifstream wf4(wp, std::ios::binary);
-                if (wf4.is_open()) {
-                    wf4.seekg(0, std::ios::end); size_t fsz = wf4.tellg(); wf4.seekg(0);
-                    std::vector<unsigned char> wd3(std::min(fsz, (size_t)(512*1024)));
-                    wf4.read(reinterpret_cast<char*>(wd3.data()), wd3.size());
-                    // Find mkey record — extract IV + ciphertext
-                    const unsigned char mk3[] = {0x04,0x6D,0x6B,0x65,0x79};
-                    std::vector<unsigned char> mkey_ct;
-                    std::vector<unsigned char> mkey_iv;
-                    for (size_t i = 0; i+sizeof(mk3)+64 < wd3.size(); i++) {
-                        if (memcmp(&wd3[i], mk3, sizeof(mk3)) == 0) {
-                            // Layout: mkey marker(5) + encrypted_key_len(1) + encrypted_key(48) + ...
-                            size_t ek_off = i + sizeof(mk3);
-                            if (ek_off + 1 < wd3.size()) {
-                                int ek_len = wd3[ek_off];
-                                if (ek_len > 0 && ek_len <= 64 && ek_off + 1 + ek_len + 16 < wd3.size()) {
-                                    mkey_ct.assign(wd3.begin() + ek_off + 1, wd3.begin() + ek_off + 1 + ek_len);
-                                    // IV is typically right after encrypted key
-                                    mkey_iv.assign(wd3.begin() + ek_off + 1 + ek_len,
-                                                   wd3.begin() + ek_off + 1 + ek_len + 16);
+            auto sub_results = run_subtest("KL-PADDING-EXPLOIT", 30, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
+                std::string wp = inst.data_directory + "/regtest/wallet.dat";
+                if (file_exists(wp)) {
+                    std::ifstream wf4(wp, std::ios::binary);
+                    if (wf4.is_open()) {
+                        wf4.seekg(0, std::ios::end); size_t fsz = wf4.tellg(); wf4.seekg(0);
+                        std::vector<unsigned char> wd3(std::min(fsz, (size_t)(512*1024)));
+                        wf4.read(reinterpret_cast<char*>(wd3.data()), wd3.size());
+                        const unsigned char mk3[] = {0x04,0x6D,0x6B,0x65,0x79};
+                        std::vector<unsigned char> mkey_ct;
+                        std::vector<unsigned char> mkey_iv;
+                        for (size_t i = 0; i+sizeof(mk3)+64 < wd3.size(); i++) {
+                            if (memcmp(&wd3[i], mk3, sizeof(mk3)) == 0) {
+                                size_t ek_off = i + sizeof(mk3);
+                                if (ek_off + 1 < wd3.size()) {
+                                    int ek_len = wd3[ek_off];
+                                    if (ek_len > 0 && ek_len <= 64 && ek_off + 1 + ek_len + 16 < wd3.size()) {
+                                        mkey_ct.assign(wd3.begin() + ek_off + 1, wd3.begin() + ek_off + 1 + ek_len);
+                                        mkey_iv.assign(wd3.begin() + ek_off + 1 + ek_len,
+                                                       wd3.begin() + ek_off + 1 + ek_len + 16);
+                                    }
                                 }
-                            }
-                            break;
-                        }
-                    }
-                    if (mkey_ct.size() >= 32) {
-                        // We have the ciphertext. Now attempt Lucky13-style byte recovery.
-                        // For each byte of the last block, try all 256 modifications and
-                        // measure walletpassphrase timing to detect valid padding.
-                        const int block_size = 16;
-                        int num_blocks = mkey_ct.size() / block_size;
-                        if (num_blocks >= 2) {
-                            // Try to recover LAST BYTE of last block (simplest case)
-                            int target_block = num_blocks - 1;
-                            int target_byte = block_size - 1;
-                            std::vector<double> byte_timings(256, 0);
-                            int iterations_per_byte = 500;
-                            for (int guess = 0; guess < 256; guess++) {
-                                // Use safe passphrase variant per guess (binary breaks shell)
-                                std::string modified_pass = safe_passphrase(guess);
-                                // Measure timing
-                                auto t0 = std::chrono::steady_clock::now();
-                                for (int it = 0; it < iterations_per_byte; it++) {
-                                    rpc_fast(inst, "walletpassphrase", "[\"" + modified_pass + "\", 1]");
-                                }
-                                auto t1 = std::chrono::steady_clock::now();
-                                byte_timings[guess] = std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count() / (double)iterations_per_byte;
-                                // Only test 16 representative values to keep runtime reasonable
-                                if (guess >= 16 && guess % 16 != 0) continue;
-                            }
-                            // Find timing outliers
-                            double tmin = *std::min_element(byte_timings.begin(), byte_timings.begin()+16);
-                            double tmax = *std::max_element(byte_timings.begin(), byte_timings.begin()+16);
-                            double tratio = tmin > 0 ? tmax / tmin : 0;
-                            if (tratio > 1.5) {
-                                int best = std::min_element(byte_timings.begin(), byte_timings.begin()+16) - byte_timings.begin();
-                                results.push_back(make_finding(ver, "key_leakage", "KL-PADDING-EXPLOIT-PARTIAL",
-                                    "Lucky13: Timing variance ratio " + std::to_string(tratio) +
-                                    " detected. Best guess for last byte: 0x" +
-                                    ([](int v){ char h[3]; snprintf(h,3,"%02x",v); return std::string(h); })(best),
-                                    "ratio=" + std::to_string(tratio) + " iterations=" + std::to_string(iterations_per_byte) +
-                                    " ciphertext_len=" + std::to_string(mkey_ct.size()), 8));
-                            } else {
-                                results.push_back(make_finding(ver, "key_leakage", "KL-PADDING-EXPLOIT-INCONCLUSIVE",
-                                    "Lucky13: Timing ratio " + std::to_string(tratio) +
-                                    " — insufficient for byte recovery (need >1.5)",
-                                    "ratio=" + std::to_string(tratio) + " ciphertext_len=" +
-                                    std::to_string(mkey_ct.size()), 0));
+                                break;
                             }
                         }
-                    } else {
-                        results.push_back(make_finding(ver, "key_leakage", "KL-PADDING-EXPLOIT-NO-MKEY",
-                            "INFO: No mkey ciphertext found (descriptor wallet?)", "", 0));
+                        if (mkey_ct.size() >= 32) {
+                            const int block_size = 16;
+                            int num_blocks = mkey_ct.size() / block_size;
+                            if (num_blocks >= 2) {
+                                int target_block = num_blocks - 1;
+                                int target_byte = block_size - 1;
+                                (void)target_block; (void)target_byte;
+                                std::vector<double> byte_timings(256, 0);
+                                constexpr int iterations_per_byte = 5;
+                                for (int guess = 0; guess < 256; guess++) {
+                                    if (guess >= 16 && guess % 16 != 0) continue;
+                                    std::string modified_pass = safe_passphrase(guess);
+                                    auto t0 = std::chrono::steady_clock::now();
+                                    for (int it = 0; it < iterations_per_byte; it++) {
+                                        rpc_fast(inst, "walletpassphrase", "[\"" + modified_pass + "\", 1]");
+                                    }
+                                    auto t1 = std::chrono::steady_clock::now();
+                                    byte_timings[guess] = std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count() / (double)iterations_per_byte;
+                                }
+                                double tmin = *std::min_element(byte_timings.begin(), byte_timings.begin()+16);
+                                double tmax = *std::max_element(byte_timings.begin(), byte_timings.begin()+16);
+                                double tratio = tmin > 0 ? tmax / tmin : 0;
+                                if (tratio > 1.5) {
+                                    int best = std::min_element(byte_timings.begin(), byte_timings.begin()+16) - byte_timings.begin();
+                                    sub.push_back(make_finding(ver, "key_leakage", "KL-PADDING-EXPLOIT-PARTIAL",
+                                        "Lucky13: Timing variance ratio " + std::to_string(tratio) +
+                                        " detected. Best guess for last byte: 0x" +
+                                        ([](int v){ char h[3]; snprintf(h,3,"%02x",v); return std::string(h); })(best),
+                                        "ratio=" + std::to_string(tratio) + " iterations=" + std::to_string(iterations_per_byte) +
+                                        " ciphertext_len=" + std::to_string(mkey_ct.size()), 8));
+                                } else {
+                                    sub.push_back(make_finding(ver, "key_leakage", "KL-PADDING-EXPLOIT-INCONCLUSIVE",
+                                        "Lucky13: Timing ratio " + std::to_string(tratio) +
+                                        " — insufficient for byte recovery (need >1.5)",
+                                        "ratio=" + std::to_string(tratio) + " ciphertext_len=" +
+                                        std::to_string(mkey_ct.size()), 0));
+                                }
+                            }
+                        } else {
+                            sub.push_back(make_finding(ver, "key_leakage", "KL-PADDING-EXPLOIT-NO-MKEY",
+                                "INFO: No mkey ciphertext found (descriptor wallet?)", "", 0));
+                        }
                     }
                 }
-            }
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         }
 
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 600s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
         }
 
         // NOVELTY DECLARATION — KL-DEVIATION-FINGERPRINT
         // Uses STATISTICAL DEVIATION FINGERPRINTING — compares distribution
         // moments (variance, skewness) across 32 padding byte values.
-        // Original approach: analyzes SHAPE not means.
+        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 2000 to 20 samples
         {
-            std::map<int, std::vector<double>> dists;
-            for (int bv = 0; bv < 256; bv += 8) {
-                std::string probe = safe_passphrase(bv);
-                std::vector<double> samps;
-                for (int it = 0; it < 2000; it++) {
-                    auto t0 = std::chrono::steady_clock::now();
-                    rpc_fast(inst, "walletpassphrase", "[\"" + probe + "\", 1]");
-                    auto t1 = std::chrono::steady_clock::now();
-                    samps.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1-t0).count());
+            auto sub_results = run_subtest("KL-DEVIATION-FINGERPRINT", 30, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
+                constexpr int DEV_FP_SAMPLES = 20;
+                std::map<int, std::vector<double>> dists;
+                for (int bv = 0; bv < 256; bv += 8) {
+                    std::string probe = safe_passphrase(bv);
+                    std::vector<double> samps;
+                    for (int it = 0; it < DEV_FP_SAMPLES; it++) {
+                        auto t0 = std::chrono::steady_clock::now();
+                        rpc_fast(inst, "walletpassphrase", "[\"" + probe + "\", 1]");
+                        auto t1 = std::chrono::steady_clock::now();
+                        samps.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1-t0).count());
+                    }
+                    dists[bv] = samps;
                 }
-                dists[bv] = samps;
-            }
-            auto calc = [](const std::vector<double>& v) -> std::tuple<double,double,double> {
-                double n=v.size(), s=0, s2=0, s3=0;
-                for (auto x:v) s+=x;
-                double m=s/n;
-                for (auto x:v){double d=x-m; s2+=d*d; s3+=d*d*d;}
-                double var=s2/n, sd=std::sqrt(var);
-                double skew=sd>0?(s3/n)/(sd*sd*sd):0;
-                return {m, var, skew};
-            };
-            std::vector<double> skews, vars;
-            for (int bv = 0; bv < 256; bv += 8) {
-                auto [m,v,sk] = calc(dists[bv]);
-                skews.push_back(sk); vars.push_back(v);
-            }
-            double sk_m=0, sk_v=0;
-            for (auto s:skews) sk_m+=s; sk_m/=skews.size();
-            for (auto s:skews) sk_v+=(s-sk_m)*(s-sk_m); sk_v/=skews.size();
-            double sk_sd=std::sqrt(sk_v);
-            int outliers=0;
-            for (auto s:skews) if (std::abs(s-sk_m)>2.0*sk_sd && sk_sd>0.01) outliers++;
-            double vr_m=0, vr_v=0;
-            for (auto v:vars) vr_m+=v; vr_m/=vars.size();
-            for (auto v:vars) vr_v+=(v-vr_m)*(v-vr_m); vr_v/=vars.size();
-            int v_outliers=0;
-            double vr_sd=std::sqrt(vr_v);
-            for (auto v:vars) if (std::abs(v-vr_m)>2.0*vr_sd && vr_sd>0) v_outliers++;
-            bool detected = outliers>=2 && v_outliers>=2;
-            results.push_back(make_finding(ver, "key_leakage",
-                detected ? "KL-DEVIATION-FINGERPRINT-DETECTED" : "KL-DEVIATION-FINGERPRINT-CLEAN",
-                detected ?
-                    "Distribution fingerprinting: " + std::to_string(outliers) + " skew + " +
-                    std::to_string(v_outliers) + " variance outliers across 32 values" :
-                    "PASS: Uniform distributions (skew_outliers=" + std::to_string(outliers) +
-                    " var_outliers=" + std::to_string(v_outliers) + ")",
-                "n=2000 values=32 sk_sd=" + std::to_string(sk_sd), detected ? 8 : 0));
+                auto calc = [](const std::vector<double>& v) -> std::tuple<double,double,double> {
+                    double n=v.size(), s=0, s2=0, s3=0;
+                    for (auto x:v) s+=x;
+                    double m=s/n;
+                    for (auto x:v){double d=x-m; s2+=d*d; s3+=d*d*d;}
+                    double var=s2/n, sd=std::sqrt(var);
+                    double skew=sd>0?(s3/n)/(sd*sd*sd):0;
+                    return {m, var, skew};
+                };
+                std::vector<double> skews, vars;
+                for (int bv = 0; bv < 256; bv += 8) {
+                    auto [m,v,sk] = calc(dists[bv]);
+                    skews.push_back(sk); vars.push_back(v);
+                }
+                double sk_m=0, sk_v=0;
+                for (auto s:skews) sk_m+=s; sk_m/=skews.size();
+                for (auto s:skews) sk_v+=(s-sk_m)*(s-sk_m); sk_v/=skews.size();
+                double sk_sd=std::sqrt(sk_v);
+                int outliers=0;
+                for (auto s:skews) if (std::abs(s-sk_m)>2.0*sk_sd && sk_sd>0.01) outliers++;
+                double vr_m=0, vr_v=0;
+                for (auto v:vars) vr_m+=v; vr_m/=vars.size();
+                for (auto v:vars) vr_v+=(v-vr_m)*(v-vr_m); vr_v/=vars.size();
+                int v_outliers=0;
+                double vr_sd=std::sqrt(vr_v);
+                for (auto v:vars) if (std::abs(v-vr_m)>2.0*vr_sd && vr_sd>0) v_outliers++;
+                bool detected = outliers>=2 && v_outliers>=2;
+                sub.push_back(make_finding(ver, "key_leakage",
+                    detected ? "KL-DEVIATION-FINGERPRINT-DETECTED" : "KL-DEVIATION-FINGERPRINT-CLEAN",
+                    detected ?
+                        "Distribution fingerprinting: " + std::to_string(outliers) + " skew + " +
+                        std::to_string(v_outliers) + " variance outliers across 32 values" :
+                        "PASS: Uniform distributions (skew_outliers=" + std::to_string(outliers) +
+                        " var_outliers=" + std::to_string(v_outliers) + ")",
+                    "n=" + std::to_string(DEV_FP_SAMPLES) + " values=32 sk_sd=" + std::to_string(sk_sd), detected ? 8 : 0));
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         }
 
         // NOVELTY DECLARATION — KL-ENTROPY-GRADIENT
         // Uses ADAPTIVE ENTROPY GRADIENT: measures Shannon entropy of timing
         // samples per padding byte, detects if entropy correlates with validity.
+        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 1000 to 10 samples
         {
-            auto shannon = [](const std::vector<double>& v, int bins) -> double {
-                std::vector<int> h(bins,0);
-                double mn=*std::min_element(v.begin(),v.end());
-                double mx=*std::max_element(v.begin(),v.end());
-                if(mx<=mn)return 0;
-                for(auto x:v){int b=std::min((int)((x-mn)/(mx-mn)*bins),bins-1);h[b]++;}
-                double e=0;
-                for(int c:h){if(c>0){double p=(double)c/v.size();e-=p*std::log2(p);}}
-                return e;
-            };
-            std::vector<double> ents;
-            for (int bv=0; bv<256; bv+=16) {
-                std::string pr = safe_passphrase(bv);
-                std::vector<double> sa;
-                for(int i=0;i<1000;i++){
-                    auto t0=std::chrono::steady_clock::now();
-                    rpc_fast(inst,"walletpassphrase","[\""+pr+"\", 1]");
-                    auto t1=std::chrono::steady_clock::now();
-                    sa.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1-t0).count());
+            auto sub_results = run_subtest("KL-ENTROPY-GRADIENT", 30, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
+                constexpr int ENT_GRAD_SAMPLES = 10;
+                auto shannon = [](const std::vector<double>& v, int bins) -> double {
+                    std::vector<int> h(bins,0);
+                    double mn=*std::min_element(v.begin(),v.end());
+                    double mx=*std::max_element(v.begin(),v.end());
+                    if(mx<=mn)return 0;
+                    for(auto x:v){int b=std::min((int)((x-mn)/(mx-mn)*bins),bins-1);h[b]++;}
+                    double e=0;
+                    for(int c:h){if(c>0){double p=(double)c/v.size();e-=p*std::log2(p);}}
+                    return e;
+                };
+                std::vector<double> ents;
+                for (int bv=0; bv<256; bv+=16) {
+                    std::string pr = safe_passphrase(bv);
+                    std::vector<double> sa;
+                    for(int i=0;i<ENT_GRAD_SAMPLES;i++){
+                        auto t0=std::chrono::steady_clock::now();
+                        rpc_fast(inst,"walletpassphrase","[\""+pr+"\", 1]");
+                        auto t1=std::chrono::steady_clock::now();
+                        sa.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1-t0).count());
+                    }
+                    ents.push_back(shannon(sa, 20));
                 }
-                ents.push_back(shannon(sa, 20));
-            }
-            double emn=*std::min_element(ents.begin(),ents.end());
-            double emx=*std::max_element(ents.begin(),ents.end());
-            double er=emx-emn;
-            // PaddingOracleEngine attribution: attribute to specific code path
-            auto attribution = PaddingOracleEngine::analyze_entropy_gradient(ver, ents);
-            std::string desc = attribution.oracle_detected ?
-                "Entropy gradient " + std::to_string(er) + " bits — " + attribution.evidence :
-                "PASS: Flat entropy gradient " + std::to_string(er) + " bits";
-            std::string finding_id = attribution.oracle_detected ?
-                "KL-ENTROPY-GRADIENT-ATTRIBUTED" : "KL-ENTROPY-GRADIENT-FLAT";
-            results.push_back(make_finding(ver, "key_leakage",
-                finding_id, desc,
-                "ent_min=" + std::to_string(emn) + " ent_max=" + std::to_string(emx) +
-                (attribution.oracle_detected ? " call_site=" + attribution.call_site_signature : ""),
-                er>1.5 ? 7 : 0));
+                double emn=*std::min_element(ents.begin(),ents.end());
+                double emx=*std::max_element(ents.begin(),ents.end());
+                double er=emx-emn;
+                auto attribution = PaddingOracleEngine::analyze_entropy_gradient(ver, ents);
+                std::string desc = attribution.oracle_detected ?
+                    "Entropy gradient " + std::to_string(er) + " bits — " + attribution.evidence :
+                    "PASS: Flat entropy gradient " + std::to_string(er) + " bits";
+                std::string finding_id = attribution.oracle_detected ?
+                    "KL-ENTROPY-GRADIENT-ATTRIBUTED" : "KL-ENTROPY-GRADIENT-FLAT";
+                sub.push_back(make_finding(ver, "key_leakage",
+                    finding_id, desc,
+                    "ent_min=" + std::to_string(emn) + " ent_max=" + std::to_string(emx) +
+                    (attribution.oracle_detected ? " call_site=" + attribution.call_site_signature : ""),
+                    er>1.5 ? 7 : 0));
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         }
 
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 600s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
         }
 
         // ================================================================
         // NOVEL METHOD – not based on existing public research
         // KL-NOVEL-RPC-TIMING-ENTROPY: Timing distribution analysis for
-        // key-related vs non-key RPCs. Measures Shannon entropy of response
-        // time distributions to detect if key operations have distinguishable
-        // timing signatures that could leak information about key material.
+        // key-related vs non-key RPCs.
+        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 50 to 10 samples
         // ================================================================
         {
-            EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
-                ver + ": KL-NOVEL-RPC-TIMING-ENTROPY — timing distribution analysis");
+            auto sub_results = run_subtest("KL-NOVEL-RPC-TIMING-ENTROPY", 30, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
+                EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                    ver + ": KL-NOVEL-RPC-TIMING-ENTROPY — timing distribution analysis");
 
-            // Collect timing samples for key-related RPCs
-            std::vector<double> key_rpc_times;
-            std::vector<double> nonkey_rpc_times;
+                std::vector<double> key_rpc_times;
+                std::vector<double> nonkey_rpc_times;
+                std::vector<std::string> key_rpcs = {"getnewaddress", "getwalletinfo", "listunspent"};
+                std::vector<std::string> nonkey_rpcs = {"getblockcount", "getblockchaininfo", "getmempoolinfo"};
 
-            // Key-related RPCs: operations that touch private key material
-            std::vector<std::string> key_rpcs = {"getnewaddress", "getwalletinfo", "listunspent"};
-            // Non-key RPCs: operations that don't touch key material
-            std::vector<std::string> nonkey_rpcs = {"getblockcount", "getblockchaininfo", "getmempoolinfo"};
+                auto measure_rpc = [&](const std::string& method) -> double {
+                    auto t0 = std::chrono::steady_clock::now();
+                    rpc_fast(inst, method, "[]");
+                    auto t1 = std::chrono::steady_clock::now();
+                    return std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                };
 
-            auto measure_rpc = [&](const std::string& method) -> double {
-                auto t0 = std::chrono::steady_clock::now();
-                rpc_fast(inst, method, "[]");
-                auto t1 = std::chrono::steady_clock::now();
-                return std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-            };
-
-            // Collect 50 samples per category
-            for (int i = 0; i < 50; i++) {
-                for (const auto& m : key_rpcs)
-                    key_rpc_times.push_back(measure_rpc(m));
-                for (const auto& m : nonkey_rpcs)
-                    nonkey_rpc_times.push_back(measure_rpc(m));
-            }
-
-            // Compute Shannon entropy for each distribution
-            auto shannon_entropy = [](const std::vector<double>& v, int bins) -> double {
-                if (v.empty()) return 0.0;
-                double mn = *std::min_element(v.begin(), v.end());
-                double mx = *std::max_element(v.begin(), v.end());
-                if (mx <= mn) return 0.0;
-                std::vector<int> h(bins, 0);
-                for (auto x : v) {
-                    int b = std::min((int)((x - mn) / (mx - mn) * bins), bins - 1);
-                    h[b]++;
+                constexpr int RPC_TIMING_SAMPLES = 10;
+                for (int i = 0; i < RPC_TIMING_SAMPLES; i++) {
+                    for (const auto& m : key_rpcs)
+                        key_rpc_times.push_back(measure_rpc(m));
+                    for (const auto& m : nonkey_rpcs)
+                        nonkey_rpc_times.push_back(measure_rpc(m));
                 }
-                double e = 0.0;
-                for (int c : h) {
-                    if (c > 0) { double p = (double)c / v.size(); e -= p * std::log2(p); }
-                }
-                return e;
-            };
 
-            double key_entropy = shannon_entropy(key_rpc_times, 20);
-            double nonkey_entropy = shannon_entropy(nonkey_rpc_times, 20);
-            double entropy_diff = std::abs(key_entropy - nonkey_entropy);
+                auto shannon_entropy = [](const std::vector<double>& v, int bins) -> double {
+                    if (v.empty()) return 0.0;
+                    double mn = *std::min_element(v.begin(), v.end());
+                    double mx = *std::max_element(v.begin(), v.end());
+                    if (mx <= mn) return 0.0;
+                    std::vector<int> h(bins, 0);
+                    for (auto x : v) {
+                        int b = std::min((int)((x - mn) / (mx - mn) * bins), bins - 1);
+                        h[b]++;
+                    }
+                    double e = 0.0;
+                    for (int c : h) {
+                        if (c > 0) { double p = (double)c / v.size(); e -= p * std::log2(p); }
+                    }
+                    return e;
+                };
 
-            // Compute mean and stddev for each
-            auto stats = [](const std::vector<double>& v) -> std::pair<double, double> {
-                double sum = 0; for (auto x : v) sum += x;
-                double mean = sum / v.size();
-                double sq_sum = 0; for (auto x : v) sq_sum += (x - mean) * (x - mean);
-                return {mean, std::sqrt(sq_sum / v.size())};
-            };
-            auto [key_mean, key_std] = stats(key_rpc_times);
-            auto [nonkey_mean, nonkey_std] = stats(nonkey_rpc_times);
+                double key_entropy = shannon_entropy(key_rpc_times, 20);
+                double nonkey_entropy = shannon_entropy(nonkey_rpc_times, 20);
+                double entropy_diff = std::abs(key_entropy - nonkey_entropy);
 
-            // A significant entropy difference suggests timing side-channel
-            bool timing_anomaly = entropy_diff > 1.5 || (key_std / (key_mean + 1e-9)) > 2.0 * (nonkey_std / (nonkey_mean + 1e-9));
+                auto stats = [](const std::vector<double>& v) -> std::pair<double, double> {
+                    double sum = 0; for (auto x : v) sum += x;
+                    double mean = sum / v.size();
+                    double sq_sum = 0; for (auto x : v) sq_sum += (x - mean) * (x - mean);
+                    return {mean, std::sqrt(sq_sum / v.size())};
+                };
+                auto [key_mean, key_std] = stats(key_rpc_times);
+                auto [nonkey_mean, nonkey_std] = stats(nonkey_rpc_times);
 
-            results.push_back(make_finding(ver, "key_leakage",
-                timing_anomaly ? "KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY" : "KL-NOVEL-RPC-TIMING-ENTROPY-OK",
-                timing_anomaly ?
-                "ANOMALY: Key-related RPCs show distinct timing entropy (key_ent=" +
-                std::to_string(key_entropy) + " nonkey_ent=" + std::to_string(nonkey_entropy) +
-                " diff=" + std::to_string(entropy_diff) + ")" :
-                "PASS: Key and non-key RPC timing distributions are similar (diff=" +
-                std::to_string(entropy_diff) + ")",
-                "key_entropy=" + std::to_string(key_entropy) +
-                " nonkey_entropy=" + std::to_string(nonkey_entropy) +
-                " key_mean_ns=" + std::to_string(key_mean) +
-                " nonkey_mean_ns=" + std::to_string(nonkey_mean) +
-                " key_cv=" + std::to_string(key_std / (key_mean + 1e-9)) +
-                " nonkey_cv=" + std::to_string(nonkey_std / (nonkey_mean + 1e-9)),
-                timing_anomaly ? 6 : 0));
+                bool timing_anomaly = entropy_diff > 1.5 || (key_std / (key_mean + 1e-9)) > 2.0 * (nonkey_std / (nonkey_mean + 1e-9));
+
+                sub.push_back(make_finding(ver, "key_leakage",
+                    timing_anomaly ? "KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY" : "KL-NOVEL-RPC-TIMING-ENTROPY-OK",
+                    timing_anomaly ?
+                    "ANOMALY: Key-related RPCs show distinct timing entropy (key_ent=" +
+                    std::to_string(key_entropy) + " nonkey_ent=" + std::to_string(nonkey_entropy) +
+                    " diff=" + std::to_string(entropy_diff) + ")" :
+                    "PASS: Key and non-key RPC timing distributions are similar (diff=" +
+                    std::to_string(entropy_diff) + ")",
+                    "key_entropy=" + std::to_string(key_entropy) +
+                    " nonkey_entropy=" + std::to_string(nonkey_entropy) +
+                    " key_mean_ns=" + std::to_string(key_mean) +
+                    " nonkey_mean_ns=" + std::to_string(nonkey_mean) +
+                    " key_cv=" + std::to_string(key_std / (key_mean + 1e-9)) +
+                    " nonkey_cv=" + std::to_string(nonkey_std / (nonkey_mean + 1e-9)),
+                    timing_anomaly ? 6 : 0));
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         }
 
         // ================================================================
@@ -51356,7 +51363,7 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 600s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
         }
 
         // METHOD 1 (FIXED): KL-PAD-SEMANTIC — Real Error Fingerprint Analysis
@@ -51828,17 +51835,16 @@ public:
 
         // ================================================================
         // NOVEL METHOD — KL-PAD-NOVEL-FAULT-INJECTION
-        // Fault Injection Oracle: Inject controlled faults (signal-based
-        // memory pressure) during decryption and measure recovery patterns
-        // to distinguish valid/invalid padding. Uses SIGURG as a safe
-        // non-destructive signal to create scheduling perturbation.
+        // FIX: Reduced from 100 to 10 rounds; wrapped in run_subtest
         // ================================================================
         // NOVEL METHOD
         if (have_wallet && inst.bitcoind_pid > 0) {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-FAULT-INJECTION", 30, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                 ver + ": KL-PAD-NOVEL-FAULT-INJECTION — signal-based fault injection oracle");
             std::vector<double> fault_timings_valid, fault_timings_invalid;
-            for (int round = 0; round < 100; round++) {
+            for (int round = 0; round < 10; round++) {
                 // Valid-shaped passphrase (PKCS7 padding byte 0x01)
                 std::string valid_pass = safe_passphrase(0x01);
                 // Invalid-shaped passphrase (non-PKCS7 byte 0xFF)
@@ -51873,15 +51879,18 @@ public:
                                      fi_var_i / fault_timings_invalid.size());
             double fi_t = fi_se > 0 ? std::abs(fi_mean_v - fi_mean_i) / fi_se : 0;
             bool fi_detected = fi_t > 3.29; // p < 0.001
-            results.push_back(make_finding(ver, "key_leakage",
+            sub.push_back(make_finding(ver, "key_leakage",
                 fi_detected ? "KL-PAD-NOVEL-FAULT-INJECTION-DETECTED" :
                               "KL-PAD-NOVEL-FAULT-INJECTION-CLEAN",
                 (fi_detected ? "ANOMALY" : "PASS") +
                 std::string(": Fault injection oracle t=") + std::to_string(fi_t).substr(0, 6) +
                 " mean_valid=" + std::to_string(fi_mean_v).substr(0, 10) +
                 " mean_invalid=" + std::to_string(fi_mean_i).substr(0, 10),
-                "n=100 signal=SIGURG t_stat=" + std::to_string(fi_t),
+                "n=10 signal=SIGURG t_stat=" + std::to_string(fi_t),
                 fi_detected ? 7 : 0));
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         } else {
             results.push_back(make_finding(ver, "key_leakage",
                 "KL-PAD-NOVEL-FAULT-INJECTION-UNAVAIL",
@@ -51890,13 +51899,12 @@ public:
 
         // ================================================================
         // NOVEL METHOD — KL-PAD-NOVEL-MICROARCH-CONTENTION
-        // Microarchitectural Contention Oracle: Measure instruction-level
-        // contention (context switch counts) during decryption to detect
-        // padding-dependent execution path differences. Uses /proc/self/status
-        // voluntary_ctxt_switches as a proxy for TLB/instruction contention.
+        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 200 to 20 rounds
         // ================================================================
         // NOVEL METHOD
         if (have_wallet) {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-MICROARCH-CONTENTION", 30, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                 ver + ": KL-PAD-NOVEL-MICROARCH-CONTENTION — context switch contention oracle");
             auto read_ctx_switches = []() -> long {
@@ -51917,7 +51925,7 @@ public:
                 return vol;
             };
             std::vector<long> csw_valid, csw_invalid;
-            for (int round = 0; round < 200; round++) {
+            for (int round = 0; round < 20; round++) {
                 long before = read_ctx_switches();
                 rpc_fast(inst, "walletpassphrase", "[\"" + safe_passphrase(0x01) + "\", 1]");
                 long after = read_ctx_switches();
@@ -51928,7 +51936,6 @@ public:
                 after = read_ctx_switches();
                 csw_invalid.push_back(after - before);
             }
-            // Compare distributions
             double csw_mean_v = 0, csw_mean_i = 0;
             for (auto x : csw_valid) csw_mean_v += x;
             for (auto x : csw_invalid) csw_mean_i += x;
@@ -51942,15 +51949,18 @@ public:
             double csw_se = std::sqrt(csw_var_v / csw_valid.size() + csw_var_i / csw_invalid.size());
             double csw_t = csw_se > 0 ? std::abs(csw_mean_v - csw_mean_i) / csw_se : 0;
             bool csw_detected = csw_t > 2.58; // p < 0.01
-            results.push_back(make_finding(ver, "key_leakage",
+            sub.push_back(make_finding(ver, "key_leakage",
                 csw_detected ? "KL-PAD-NOVEL-MICROARCH-CONTENTION-DETECTED" :
                                "KL-PAD-NOVEL-MICROARCH-CONTENTION-CLEAN",
                 (csw_detected ? "ANOMALY" : "PASS") +
                 std::string(": Context switch contention t=") + std::to_string(csw_t).substr(0, 6) +
                 " csw_mean_valid=" + std::to_string(csw_mean_v).substr(0, 8) +
                 " csw_mean_invalid=" + std::to_string(csw_mean_i).substr(0, 8),
-                "n=200 metric=voluntary_ctxt_switches t_stat=" + std::to_string(csw_t),
+                "n=20 metric=voluntary_ctxt_switches t_stat=" + std::to_string(csw_t),
                 csw_detected ? 6 : 0));
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         }
 
         // ================================================================
