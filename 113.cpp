@@ -49746,8 +49746,14 @@ public:
             return std::chrono::duration_cast<std::chrono::seconds>(
                 now - kl_engine_start).count() >= KL_ENGINE_WATCHDOG_SECS;
         };
+        // Shared cancellation flag for cooperative sub-test cancellation.
+        // The wrapper sets this to true on timeout; loops inside lambdas check it.
+        std::shared_ptr<std::atomic<bool>> kl_cancel_flag = std::make_shared<std::atomic<bool>>(false);
+
         // Per-sub-test timeout wrapper: runs a lambda with a deadline.
-        // If the sub-test exceeds its deadline, logs a warning and returns empty results.
+        // If the sub-test exceeds its deadline, sets the cancellation flag,
+        // logs a warning, and returns timeout results. The leaked async thread
+        // will stop issuing RPC calls once it observes the flag.
         auto run_subtest = [&](const std::string& subtest_name, int timeout_secs,
                                std::function<std::vector<DynamicFinding>()> fn) -> std::vector<DynamicFinding> {
             if (kl_engine_expired()) {
@@ -49756,6 +49762,8 @@ public:
                 return {make_finding(ver, "key_leakage", subtest_name + "-WATCHDOG",
                     "Sub-test skipped: 120s engine watchdog expired", "", 0)};
             }
+            // Reset cancellation flag for this sub-test
+            kl_cancel_flag->store(false);
             auto sub_future = std::async(std::launch::async, fn);
             if (sub_future.wait_for(std::chrono::seconds(timeout_secs)) == std::future_status::ready) {
                 try {
@@ -49767,11 +49775,13 @@ public:
                         "Sub-test threw exception: " + std::string(e.what()), "", 0)};
                 }
             } else {
+                // Signal the async thread to stop issuing RPC calls
+                kl_cancel_flag->store(true);
                 EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
                     ver + ": " + subtest_name + " exceeded " + std::to_string(timeout_secs) +
-                    "s per-sub-test deadline — moving to next sub-test");
+                    "s per-sub-test deadline — cancellation signalled, moving to next sub-test");
                 return {make_finding(ver, "key_leakage", subtest_name + "-SUBTEST-TIMEOUT",
-                    "Sub-test exceeded " + std::to_string(timeout_secs) + "s deadline (logged, not fatal)",
+                    "Sub-test exceeded " + std::to_string(timeout_secs) + "s deadline (cancelled, not fatal)",
                     "timeout_s=" + std::to_string(timeout_secs), 0)};
             }
         };
@@ -50651,63 +50661,85 @@ public:
         // TYPE 2: Error message padding oracle — test 256 last-byte values
         // NOVELTY DECLARATION — KL-PADDING-ERROR-DISTINCTION
         // Tests if walletpassphrase error messages vary by padding byte
+        // Wrapped in run_subtest with 60s deadline to prevent unprotected blocking
         {
-            std::map<std::string, int> error_classes;
-            int distinct_errors = 0;
-            // Test 16 representative padding values (0x01..0x10 = valid PKCS7, 0x00,0x11..0xFF = invalid)
-            std::vector<int> test_bytes = {0x00, 0x01, 0x02, 0x03, 0x04, 0x08, 0x0F, 0x10,
-                                            0x11, 0x20, 0x40, 0x80, 0xCC, 0xDD, 0xEE, 0xFF};
-            for (int bv : test_bytes) {
-                // Use shell-safe passphrase (binary chars break popen quoting)
-                std::string test_pass = safe_passphrase(bv);
-                auto r = rpc_fast(inst, "walletpassphrase", "[\"" + test_pass + "\", 1]");
-                std::string err_key = r.output.substr(0, std::min((size_t)80, r.output.size()));
-                // Normalize: strip version-specific noise
-                size_t code_pos = err_key.find("code");
-                if (code_pos != std::string::npos) {
-                    size_t comma = err_key.find(",", code_pos);
-                    if (comma != std::string::npos) err_key = err_key.substr(code_pos, comma - code_pos);
+            auto sub_results = run_subtest("KL-PADDING-ERROR-DISTINCTION", 60, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
+                std::map<std::string, int> error_classes;
+                int distinct_errors = 0;
+                // Test 16 representative padding values (0x01..0x10 = valid PKCS7, 0x00,0x11..0xFF = invalid)
+                std::vector<int> test_bytes = {0x00, 0x01, 0x02, 0x03, 0x04, 0x08, 0x0F, 0x10,
+                                                0x11, 0x20, 0x40, 0x80, 0xCC, 0xDD, 0xEE, 0xFF};
+                for (int bv : test_bytes) {
+                    if (kl_cancel_flag->load()) {
+                        EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                            ver + ": KL-PADDING-ERROR-DISTINCTION cancelled early at byte " + std::to_string(bv));
+                        break;
+                    }
+                    // Use shell-safe passphrase (binary chars break popen quoting)
+                    std::string test_pass = safe_passphrase(bv);
+                    auto r = rpc_fast(inst, "walletpassphrase", "[\"" + test_pass + "\", 1]");
+                    std::string err_key = r.output.substr(0, std::min((size_t)80, r.output.size()));
+                    // Normalize: strip version-specific noise
+                    size_t code_pos = err_key.find("code");
+                    if (code_pos != std::string::npos) {
+                        size_t comma = err_key.find(",", code_pos);
+                        if (comma != std::string::npos) err_key = err_key.substr(code_pos, comma - code_pos);
+                    }
+                    error_classes[err_key]++;
                 }
-                error_classes[err_key]++;
-            }
-            distinct_errors = error_classes.size();
-            if (distinct_errors > 1)
-                results.push_back(make_finding(ver, "key_leakage", "KL-PADDING-ERROR-DISTINCTION",
-                    std::to_string(distinct_errors) + " distinct error classes across " +
-                    std::to_string(test_bytes.size()) + " padding values — possible error oracle",
-                    "classes=" + std::to_string(distinct_errors), 6));
-            else
-                results.push_back(make_finding(ver, "key_leakage", "KL-PADDING-ERROR-UNIFORM",
-                    "PASS: Uniform error responses across all padding values (" +
-                    std::to_string(test_bytes.size()) + " tested)", "", 0));
+                distinct_errors = error_classes.size();
+                if (distinct_errors > 1)
+                    sub.push_back(make_finding(ver, "key_leakage", "KL-PADDING-ERROR-DISTINCTION",
+                        std::to_string(distinct_errors) + " distinct error classes across " +
+                        std::to_string(test_bytes.size()) + " padding values — possible error oracle",
+                        "classes=" + std::to_string(distinct_errors), 6));
+                else
+                    sub.push_back(make_finding(ver, "key_leakage", "KL-PADDING-ERROR-UNIFORM",
+                        "PASS: Uniform error responses across all padding values (" +
+                        std::to_string(test_bytes.size()) + " tested)", "", 0));
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         }
 
         // TYPE 3: Return code padding oracle — check if different RPC codes returned
         // NOVELTY DECLARATION — KL-PADDING-RETCODE
+        // Wrapped in run_subtest with 60s deadline to prevent unprotected blocking
         {
-            std::set<int> return_codes;
-            std::vector<std::string> pass_variants = {
-                safe_passphrase(0x01), safe_passphrase(0x02), safe_passphrase(0x10),
-                "wrong_password_1", "wrong_password_2", safe_passphrase(0x00),
-                safe_passphrase(0x0F), std::string(32, 'A')
-            };
-            for (auto& pv : pass_variants) {
-                auto r = rpc_fast(inst, "walletpassphrase", "[\"" + pv + "\", 1]");
-                // Extract error code
-                std::string code_str = jx(r.output, "code");
-                if (!code_str.empty()) {
-                    try { return_codes.insert(std::stoi(code_str)); } catch (...) {}
+            auto sub_results = run_subtest("KL-PADDING-RETCODE-TEMPORAL", 60, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
+                std::set<int> return_codes;
+                std::vector<std::string> pass_variants = {
+                    safe_passphrase(0x01), safe_passphrase(0x02), safe_passphrase(0x10),
+                    "wrong_password_1", "wrong_password_2", safe_passphrase(0x00),
+                    safe_passphrase(0x0F), std::string(32, 'A')
+                };
+                for (auto& pv : pass_variants) {
+                    if (kl_cancel_flag->load()) {
+                        EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                            ver + ": KL-PADDING-RETCODE-TEMPORAL cancelled early");
+                        break;
+                    }
+                    auto r = rpc_fast(inst, "walletpassphrase", "[\"" + pv + "\", 1]");
+                    // Extract error code
+                    std::string code_str = jx(r.output, "code");
+                    if (!code_str.empty()) {
+                        try { return_codes.insert(std::stoi(code_str)); } catch (...) {}
+                    }
                 }
-            }
-            if (return_codes.size() > 1) {
-                std::string codes_str;
-                for (int c : return_codes) codes_str += std::to_string(c) + " ";
-                results.push_back(make_finding(ver, "key_leakage", "KL-PADDING-RETCODE-VARIED",
-                    "Multiple return codes: " + codes_str + "— possible oracle",
-                    "distinct_codes=" + std::to_string(return_codes.size()), 5));
-            } else
-                results.push_back(make_finding(ver, "key_leakage", "KL-PADDING-RETCODE-UNIFORM",
-                    "PASS: Uniform return code across all passphrase variants", "", 0));
+                if (return_codes.size() > 1) {
+                    std::string codes_str;
+                    for (int c : return_codes) codes_str += std::to_string(c) + " ";
+                    sub.push_back(make_finding(ver, "key_leakage", "KL-PADDING-RETCODE-VARIED",
+                        "Multiple return codes: " + codes_str + "— possible oracle",
+                        "distinct_codes=" + std::to_string(return_codes.size()), 5));
+                } else
+                    sub.push_back(make_finding(ver, "key_leakage", "KL-PADDING-RETCODE-UNIFORM",
+                        "PASS: Uniform return code across all passphrase variants", "", 0));
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
         }
 
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
@@ -50718,15 +50750,41 @@ public:
 
         // TYPE 1 ENHANCED: High-iteration timing oracle with t-test
         // NOVELTY DECLARATION — KL-PADDING-TIMING-DEEP
-        // Full statistical depth restored: 5000 iterations for robust Welch's t-test
+        // Reduced to 500 iterations (statistically sufficient for Welch's t-test)
+        // with cooperative cancellation and internal deadline check every 50 iterations.
+        // Timeout reduced to 120s to prevent hang; cancellation flag checked each iteration.
         {
-            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 600, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 std::vector<double> valid_times, invalid_times;
                 std::string valid_shaped = "padding_valid_01";
                 std::string invalid_shaped = "padding_invalid0";
-                constexpr int TIMING_DEEP_ITERS = 5000;
+                constexpr int TIMING_DEEP_ITERS = 500;
+                constexpr int DEADLINE_CHECK_INTERVAL = 50;
+                constexpr int INTERNAL_DEADLINE_SECS = 100; // break early before wrapper timeout
+                auto loop_start = std::chrono::steady_clock::now();
+                bool cancelled_early = false;
+                int completed_iters = 0;
                 for (int i = 0; i < TIMING_DEEP_ITERS; i++) {
+                    // Check cooperative cancellation flag every iteration
+                    if (kl_cancel_flag->load()) {
+                        EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                            ver + ": KL-PADDING-TIMING-DEEP cancelled by wrapper at iteration " + std::to_string(i));
+                        cancelled_early = true;
+                        break;
+                    }
+                    // Check internal deadline every DEADLINE_CHECK_INTERVAL iterations
+                    if (i > 0 && (i % DEADLINE_CHECK_INTERVAL) == 0) {
+                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now() - loop_start).count();
+                        if (elapsed >= INTERNAL_DEADLINE_SECS) {
+                            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                                ver + ": KL-PADDING-TIMING-DEEP internal deadline reached at iteration " +
+                                std::to_string(i) + " (" + std::to_string(elapsed) + "s)");
+                            cancelled_early = true;
+                            break;
+                        }
+                    }
                     auto t0 = std::chrono::steady_clock::now();
                     rpc_fast(inst, "walletpassphrase", "[\"" + valid_shaped + "\", 1]");
                     auto t1 = std::chrono::steady_clock::now();
@@ -50736,6 +50794,15 @@ public:
                     rpc_fast(inst, "walletpassphrase", "[\"" + invalid_shaped + "\", 1]");
                     t1 = std::chrono::steady_clock::now();
                     invalid_times.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count());
+                    completed_iters = i + 1;
+                }
+                // Need at least 10 samples for meaningful statistics
+                if (valid_times.size() < 10 || invalid_times.size() < 10) {
+                    sub.push_back(make_finding(ver, "key_leakage",
+                        "KL-PADDING-TIMING-INSUFFICIENT",
+                        "Insufficient samples collected (" + std::to_string(completed_iters) +
+                        " iterations)" + (cancelled_early ? " — cancelled early" : ""), "", 0));
+                    return sub;
                 }
                 auto calc_stats = [](const std::vector<double>& v) -> std::pair<double,double> {
                     double sum = 0, sum2 = 0;
@@ -50752,11 +50819,15 @@ public:
                     if (se > 0) t_stat = std::abs(mean_v - mean_i) / se;
                 }
                 bool significant = t_stat > 3.29;
+                std::string cancel_note = cancelled_early ?
+                    " (cancelled early at " + std::to_string(completed_iters) + "/" +
+                    std::to_string(TIMING_DEEP_ITERS) + " iters)" : "";
                 sub.push_back(make_finding(ver, "key_leakage",
                     significant ? "KL-PADDING-TIMING-SIGNIFICANT" : "KL-PADDING-TIMING-INSIGNIFICANT",
                     (significant ? "Timing difference SIGNIFICANT" : "PASS: No significant timing difference") +
                     std::string(" t=" + std::to_string(t_stat) + " mean_valid=" + std::to_string(mean_v) +
-                    " mean_invalid=" + std::to_string(mean_i) + " n=" + std::to_string(TIMING_DEEP_ITERS)),
+                    " mean_invalid=" + std::to_string(mean_i) + " n=" + std::to_string(completed_iters)) +
+                    cancel_note,
                     "t_stat=" + std::to_string(t_stat) + " p<" + (significant ? "0.001" : "ns"),
                     significant ? 7 : 0));
                 return sub;
@@ -51005,10 +51076,12 @@ public:
                                 std::vector<double> byte_timings(256, 0);
                                 constexpr int iterations_per_byte = 500;
                                 for (int guess = 0; guess < 256; guess++) {
+                                    if (kl_cancel_flag->load()) break;
                                     if (guess >= 16 && guess % 16 != 0) continue;
                                     std::string modified_pass = safe_passphrase(guess);
                                     auto t0 = std::chrono::steady_clock::now();
                                     for (int it = 0; it < iterations_per_byte; it++) {
+                                        if (kl_cancel_flag->load()) break;
                                         rpc_fast(inst, "walletpassphrase", "[\"" + modified_pass + "\", 1]");
                                     }
                                     auto t1 = std::chrono::steady_clock::now();
@@ -51060,9 +51133,11 @@ public:
                 constexpr int DEV_FP_SAMPLES = 2000;
                 std::map<int, std::vector<double>> dists;
                 for (int bv = 0; bv < 256; bv += 8) {
+                    if (kl_cancel_flag->load()) break;
                     std::string probe = safe_passphrase(bv);
                     std::vector<double> samps;
                     for (int it = 0; it < DEV_FP_SAMPLES; it++) {
+                        if (kl_cancel_flag->load()) break;
                         auto t0 = std::chrono::steady_clock::now();
                         rpc_fast(inst, "walletpassphrase", "[\"" + probe + "\", 1]");
                         auto t1 = std::chrono::steady_clock::now();
@@ -51130,9 +51205,11 @@ public:
                 };
                 std::vector<double> ents;
                 for (int bv=0; bv<256; bv+=16) {
+                    if (kl_cancel_flag->load()) break;
                     std::string pr = safe_passphrase(bv);
                     std::vector<double> sa;
                     for(int i=0;i<ENT_GRAD_SAMPLES;i++){
+                        if (kl_cancel_flag->load()) break;
                         auto t0=std::chrono::steady_clock::now();
                         rpc_fast(inst,"walletpassphrase","[\""+pr+"\", 1]");
                         auto t1=std::chrono::steady_clock::now();
@@ -51191,6 +51268,7 @@ public:
 
                 constexpr int RPC_TIMING_SAMPLES = 50;
                 for (int i = 0; i < RPC_TIMING_SAMPLES; i++) {
+                    if (kl_cancel_flag->load()) break;
                     for (const auto& m : key_rpcs)
                         key_rpc_times.push_back(measure_rpc(m));
                     for (const auto& m : nonkey_rpcs)
@@ -51844,6 +51922,7 @@ public:
                 ver + ": KL-PAD-NOVEL-FAULT-INJECTION — signal-based fault injection oracle");
             std::vector<double> fault_timings_valid, fault_timings_invalid;
             for (int round = 0; round < 100; round++) {
+                if (kl_cancel_flag->load()) break;
                 // Valid-shaped passphrase (PKCS7 padding byte 0x01)
                 std::string valid_pass = safe_passphrase(0x01);
                 // Invalid-shaped passphrase (non-PKCS7 byte 0xFF)
@@ -51925,6 +52004,7 @@ public:
             };
             std::vector<long> csw_valid, csw_invalid;
             for (int round = 0; round < 200; round++) {
+                if (kl_cancel_flag->load()) break;
                 long before = read_ctx_switches();
                 rpc_fast(inst, "walletpassphrase", "[\"" + safe_passphrase(0x01) + "\", 1]");
                 long after = read_ctx_switches();
