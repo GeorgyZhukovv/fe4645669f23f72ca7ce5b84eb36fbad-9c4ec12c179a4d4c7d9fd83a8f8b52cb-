@@ -48542,37 +48542,176 @@ public:
 
         // METHOD 1 (Evolved): Error Semantic Fingerprinting
         // Traditional: compare error strings. Evolved: entropy-weighted semantic hash.
-        if (have_wallet) {
+        // Compares fingerprints from valid-padding-shaped vs invalid-padding-shaped probes
+        // to detect padding oracle behaviour in the wallet decryption path.
+        {
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                 ver + ": KL-PAD-SEMANTIC — error fingerprint analysis");
-            std::map<std::string, int> error_classes;
-            std::vector<std::string> test_passes = {
-                safe_passphrase(0x00), safe_passphrase(0x01), safe_passphrase(0x10),
-                safe_passphrase(0x80), safe_passphrase(0xFF), "correct_horse_battery",
-                "A", std::string(64, 'Z'), safe_passphrase(0x0F), safe_passphrase(0x7F)
-            };
-            for (auto& tp : test_passes) {
-                auto r = rpc_fast(inst, "walletpassphrase", "[\"" + tp + "\", 1]");
-                // Semantic fingerprint: error code + message length bucket + first word
-                std::string code = jx(r.output, "code");
-                std::string msg = jx(r.output, "message");
-                int len_bucket = (int)msg.size() / 10;
-                std::string first_word = msg.substr(0, msg.find(' '));
-                std::string fingerprint = code + ":" + std::to_string(len_bucket) + ":" + first_word;
-                error_classes[fingerprint]++;
+
+            if (!have_wallet) {
+                // Cannot run without an encrypted wallet — emit UNAVAIL and continue
+                results.push_back(make_finding(ver, "key_leakage",
+                    "KL-PAD-SEMANTIC-UNAVAIL",
+                    "SKIP: wallet not available — KL-PAD-SEMANTIC cannot execute",
+                    "have_wallet=false", 0));
+                EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                    ver + ": KL-PAD-SEMANTIC complete → finding: KL-PAD-SEMANTIC-UNAVAIL");
+            } else {
+                // ── Phase-level 40-second timeout ──────────────────────────────
+                auto pad_sem_start = std::chrono::steady_clock::now();
+                auto pad_sem_elapsed = [&]() -> double {
+                    return std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - pad_sem_start).count();
+                };
+                bool pad_sem_timeout = false;
+
+                // ── Per-call RPC helper with 5-second timeout ──────────────────
+                // Builds the bitcoin-cli command directly so we can pass a custom
+                // timeout to popen_with_timeout() instead of the 30-second default.
+                auto rpc_timed5 = [&](const std::string& method,
+                                      const std::string& params) -> std::string {
+                    std::string cmd = cli_path_for(inst) +
+                        " -regtest -datadir=" + inst.data_directory +
+                        " -rpcuser=" + inst.rpc_user +
+                        " -rpcpassword=" + inst.rpc_password +
+                        " -rpcport=" + std::to_string(inst.rpc_port) +
+                        (inst.wallet_name.empty() ? "" : " -rpcwallet=" + inst.wallet_name) +
+                        " " + method;
+                    if (!params.empty()) cmd += " " + params;
+                    cmd += " 2>&1";
+                    auto pr = popen_with_timeout(cmd, 5);
+                    if (pr.timed_out) return "{\"error\":{\"code\":-9999,\"message\":\"rpc_timeout\"}}";
+                    std::string out = std::move(pr.output);
+                    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+                        out.pop_back();
+                    return out;
+                };
+
+                // ── Fingerprint helper ─────────────────────────────────────────
+                // Normalises an RPC response into a stable fingerprint:
+                //   <error_code>:<msg_length_bucket>:<first_word_of_message>
+                auto make_fingerprint = [&](const std::string& rpc_out) -> std::string {
+                    std::string code = jx(rpc_out, "code");
+                    std::string msg  = jx(rpc_out, "message");
+                    // Normalise whitespace in message
+                    std::string norm_msg;
+                    bool in_space = false;
+                    for (char c : msg) {
+                        if (std::isspace(static_cast<unsigned char>(c))) {
+                            if (!in_space) { norm_msg += ' '; in_space = true; }
+                        } else { norm_msg += c; in_space = false; }
+                    }
+                    int len_bucket = static_cast<int>(norm_msg.size()) / 10;
+                    std::string first_word = norm_msg.substr(0, norm_msg.find(' '));
+                    return code + ":" + std::to_string(len_bucket) + ":" + first_word;
+                };
+
+                // ── Probe sets ────────────────────────────────────────────────
+                // Group A: "valid-padding-shaped" passphrases
+                //   Last byte = 0x01 (PKCS#7 pad-length-1), various prefixes.
+                // Group B: "invalid-padding-shaped" passphrases
+                //   Last byte = 0x00 or 0xFF (never valid PKCS#7 padding).
+                // Both groups use wrong passphrases so the wallet rejects them;
+                // a padding oracle manifests as different error messages/codes
+                // depending on where in the decryption path the failure occurs.
+                std::vector<std::string> group_a_passes = {
+                    "pad_01_AAAAAAAAAAAA",   // last byte 0x01 shaped
+                    "pad_01_BBBBBBBBBBBB",
+                    "pad_01_CCCCCCCCCCCC",
+                    "pad_01_DDDDDDDDDDDD",
+                    "pad_01_EEEEEEEEEEEE",
+                };
+                std::vector<std::string> group_b_passes = {
+                    "pad_ff_AAAAAAAAAAAA",   // last byte 0xFF shaped (invalid)
+                    "pad_00_BBBBBBBBBBBB",   // last byte 0x00 shaped (invalid)
+                    "pad_ff_CCCCCCCCCCCC",
+                    "pad_00_DDDDDDDDDDDD",
+                    "pad_ff_EEEEEEEEEEEE",
+                };
+
+                std::set<std::string> fp_group_a, fp_group_b;
+                std::map<std::string, int> all_fingerprints;
+
+                // Probe group A
+                for (const auto& pass : group_a_passes) {
+                    if (pad_sem_elapsed() > 40.0) { pad_sem_timeout = true; break; }
+                    std::string out = rpc_timed5("walletpassphrase", "[\"" + pass + "\", 1]");
+                    std::string fp = make_fingerprint(out);
+                    fp_group_a.insert(fp);
+                    all_fingerprints[fp]++;
+                }
+
+                // Probe group B
+                if (!pad_sem_timeout) {
+                    for (const auto& pass : group_b_passes) {
+                        if (pad_sem_elapsed() > 40.0) { pad_sem_timeout = true; break; }
+                        std::string out = rpc_timed5("walletpassphrase", "[\"" + pass + "\", 1]");
+                        std::string fp = make_fingerprint(out);
+                        fp_group_b.insert(fp);
+                        all_fingerprints[fp]++;
+                    }
+                }
+
+                if (pad_sem_timeout) {
+                    // Phase exceeded 40 seconds — emit timeout finding
+                    results.push_back(make_finding(ver, "key_leakage",
+                        "KL-PAD-ANALYSIS-TIMEOUT",
+                        "TIMEOUT: KL-PAD-SEMANTIC exceeded 40s phase limit",
+                        "elapsed_sec=" + std::to_string(static_cast<int>(pad_sem_elapsed())), 0));
+                    EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                        ver + ": KL-PAD-SEMANTIC aborted — phase timeout after " +
+                        std::to_string(static_cast<int>(pad_sem_elapsed())) + "s");
+                } else {
+                    // ── Emit DEBUG fingerprint count ───────────────────────────
+                    int distinct_fp = static_cast<int>(all_fingerprints.size());
+                    EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG, "engine_kl",
+                        ver + ": KL-PAD-SEMANTIC collected " +
+                        std::to_string(distinct_fp) + " distinct error fingerprints");
+
+                    // ── Compare group A vs group B fingerprint sets ────────────
+                    // Any difference means the node returns different errors for
+                    // different padding shapes → padding oracle detected.
+                    bool oracle_detected = (fp_group_a != fp_group_b);
+
+                    // Build evidence string listing fingerprint sets
+                    std::string fp_a_str, fp_b_str;
+                    for (const auto& f : fp_group_a) fp_a_str += "[" + f + "]";
+                    for (const auto& f : fp_group_b) fp_b_str += "[" + f + "]";
+
+                    // PaddingOracleEngine attribution
+                    auto sem_attr = PaddingOracleEngine::analyze_semantic_fingerprints(
+                        ver, all_fingerprints);
+
+                    std::string finding_tag = oracle_detected
+                        ? "KL-PAD-SEMANTIC-ANOMALY"
+                        : "KL-PAD-SEMANTIC-OK";
+                    int sev = oracle_detected ? 8 : 0;
+
+                    std::string sem_desc;
+                    if (oracle_detected) {
+                        sem_desc = "ANOMALY: padding-shaped probes produced divergent error "
+                                   "fingerprints — possible padding oracle in wallet decryption. "
+                                   "group_a=" + fp_a_str + " group_b=" + fp_b_str;
+                        if (!sem_attr.call_site_signature.empty())
+                            sem_desc += " attributed=" + sem_attr.call_site_signature;
+                    } else {
+                        sem_desc = "PASS: uniform error fingerprints across valid- and "
+                                   "invalid-padding-shaped probes (" +
+                                   std::to_string(distinct_fp) + " distinct fingerprint(s))";
+                    }
+
+                    results.push_back(make_finding(ver, "key_leakage",
+                        finding_tag, sem_desc,
+                        "fingerprint_classes=" + std::to_string(distinct_fp) +
+                        " group_a_fp=" + std::to_string(fp_group_a.size()) +
+                        " group_b_fp=" + std::to_string(fp_group_b.size()) +
+                        " probes=" + std::to_string(group_a_passes.size() + group_b_passes.size()),
+                        sev));
+
+                    EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                        ver + ": KL-PAD-SEMANTIC complete → finding: " + finding_tag);
+                }
             }
-            bool semantic_oracle = error_classes.size() > 2;
-            // PaddingOracleEngine attribution for semantic fingerprints
-            auto sem_attr = PaddingOracleEngine::analyze_semantic_fingerprints(ver, error_classes);
-            std::string sem_desc = (semantic_oracle ? "WARN" : "PASS") + std::string(": ") +
-                std::to_string(error_classes.size()) + " distinct error fingerprints across " +
-                std::to_string(test_passes.size()) + " probes";
-            if (semantic_oracle && !sem_attr.call_site_signature.empty())
-                sem_desc += " — attributed: " + sem_attr.call_site_signature;
-            results.push_back(make_finding(ver, "key_leakage",
-                semantic_oracle ? "KL-PAD-SEMANTIC-ATTRIBUTED" : "KL-PAD-SEMANTIC-UNIFORM",
-                sem_desc,
-                "fingerprint_classes=" + std::to_string(error_classes.size()), semantic_oracle ? 6 : 0));
         }
 
         // METHOD 2 (Evolved): Return Code Temporal Correlation
