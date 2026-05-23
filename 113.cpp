@@ -28901,7 +28901,7 @@ namespace enhanced_verification {
 // TIMEOUT-PROTECTED POPEN: Prevents infinite hangs from bitcoin-cli
 // Uses fork + waitpid with WNOHANG polling loop.
 // ================================================================
-static constexpr int POPEN_TIMEOUT_DEFAULT = 30;
+static constexpr int POPEN_TIMEOUT_DEFAULT = 10;
 
 struct PopenResult {
     std::string output;
@@ -47489,8 +47489,8 @@ public:
         }
 
         // ENGINE 3: Key Leakage (KL-XPRV-IN-DUMP, KL-RAWHEX, KL-BDB-IV, KL-PADDING-ORACLE, KL-NOVEL-RPC-TIMING-ENTROPY)
-        // REDESIGNED: 120s watchdog (last-resort only). Per-sub-test deadlines (30s each) handle individual timeouts.
-        // All sub-tests execute even if earlier ones time out.
+        // REDESIGNED: 1800s watchdog (last-resort only). Per-sub-test deadlines (300-600s each) handle individual timeouts.
+        // All sub-tests execute even if earlier ones time out. Full iteration depth restored.
         EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
             inst.version_string + ": Testing KL-XPRV-IN-DUMP, KL-RAWHEX-IN-DUMP, KL-BDB-IV-UNIQUE, KL-PADDING-ORACLE-TIMING, KL-NOVEL-RPC-TIMING-ENTROPY, KL-PAD-NOVEL-*, RPC-NOVEL-*, WAL-NOVEL-*");
         {
@@ -47498,15 +47498,15 @@ public:
                 return deep_key_leakage(inst, params, have_wallet);
             });
             std::vector<DynamicFinding> kl;
-            if (kl_future.wait_for(std::chrono::seconds(120)) == std::future_status::ready) {
+            if (kl_future.wait_for(std::chrono::seconds(1800)) == std::future_status::ready) {
                 kl = kl_future.get();
             } else {
                 EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                    inst.version_string + ": KL-ENGINE-WATCHDOG — deep_key_leakage exceeded 120s watchdog");
+                    inst.version_string + ": KL-ENGINE-WATCHDOG — deep_key_leakage exceeded 1800s watchdog");
                 kl.push_back(make_finding(inst.version_string, "key_leakage",
                     "KL-ENGINE-WATCHDOG",
-                    "Key leakage engine exceeded 120s watchdog — forcibly aborted",
-                    "timeout_s=120", 0));
+                    "Key leakage engine exceeded 1800s watchdog — forcibly aborted",
+                    "timeout_s=1800", 0));
             }
             all.insert(all.end(), kl.begin(), kl.end());
             log("kl", "KL-* complete", kl.size());
@@ -49739,7 +49739,7 @@ public:
         // REDESIGNED TIMEOUT: per-sub-test deadlines with 120s last-resort watchdog.
         // Each sub-test gets its own configurable timeout. If a sub-test times out,
         // we log it and move to the next — we never abort the entire engine.
-        static constexpr int KL_ENGINE_WATCHDOG_SECS = 120; // reduced from 600s; per-sub-test deadlines handle individual timeouts
+        static constexpr int KL_ENGINE_WATCHDOG_SECS = 1800; // 30 min: generous overall deadline for full-depth iterations; per-sub-test deadlines handle individual timeouts
         auto kl_engine_start = std::chrono::steady_clock::now();
         auto kl_engine_expired = [&]() -> bool {
             auto now = std::chrono::steady_clock::now();
@@ -49752,7 +49752,7 @@ public:
                                std::function<std::vector<DynamicFinding>()> fn) -> std::vector<DynamicFinding> {
             if (kl_engine_expired()) {
                 EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                    ver + ": " + subtest_name + " SKIPPED — 120s watchdog expired");
+                    ver + ": " + subtest_name + " SKIPPED — 1800s watchdog expired");
                 return {make_finding(ver, "key_leakage", subtest_name + "-WATCHDOG",
                     "Sub-test skipped: 120s engine watchdog expired", "", 0)};
             }
@@ -50713,20 +50713,19 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 1800s watchdog warning (continuing)");
         }
 
         // TYPE 1 ENHANCED: High-iteration timing oracle with t-test
         // NOVELTY DECLARATION — KL-PADDING-TIMING-DEEP
-        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 5000 to 50 iterations
-        // (n=50 is sufficient for Welch's t-test statistical power)
+        // Full statistical depth restored: 5000 iterations for robust Welch's t-test
         {
-            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 30, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 600, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 std::vector<double> valid_times, invalid_times;
                 std::string valid_shaped = "padding_valid_01";
                 std::string invalid_shaped = "padding_invalid0";
-                constexpr int TIMING_DEEP_ITERS = 50;
+                constexpr int TIMING_DEEP_ITERS = 5000;
                 for (int i = 0; i < TIMING_DEEP_ITERS; i++) {
                     auto t0 = std::chrono::steady_clock::now();
                     rpc_fast(inst, "walletpassphrase", "[\"" + valid_shaped + "\", 1]");
@@ -50768,7 +50767,7 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 1800s watchdog warning (continuing)");
         }
 
         // TYPE 5: Memory scan after walletlock — SIP-compatible multi-method approach
@@ -50961,16 +50960,16 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 1800s watchdog warning (continuing)");
         }
 
         // ================================================================
         // ENGINE 3 DEEP: KL-PADDING-EXPLOIT — Lucky13 decryption attempt
         // NOVELTY DECLARATION: Attempts to extract master key via padding oracle
-        // FIX: Wrapped in run_subtest with 30s deadline; reduced iterations_per_byte 500→5
+        // Full statistical depth restored: 16×500 iterations for robust oracle detection
         // ================================================================
         {
-            auto sub_results = run_subtest("KL-PADDING-EXPLOIT", 30, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PADDING-EXPLOIT", 600, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 std::string wp = inst.data_directory + "/regtest/wallet.dat";
                 if (file_exists(wp)) {
@@ -51004,7 +51003,7 @@ public:
                                 int target_byte = block_size - 1;
                                 (void)target_block; (void)target_byte;
                                 std::vector<double> byte_timings(256, 0);
-                                constexpr int iterations_per_byte = 5;
+                                constexpr int iterations_per_byte = 500;
                                 for (int guess = 0; guess < 256; guess++) {
                                     if (guess >= 16 && guess % 16 != 0) continue;
                                     std::string modified_pass = safe_passphrase(guess);
@@ -51048,17 +51047,17 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 1800s watchdog warning (continuing)");
         }
 
         // NOVELTY DECLARATION — KL-DEVIATION-FINGERPRINT
         // Uses STATISTICAL DEVIATION FINGERPRINTING — compares distribution
         // moments (variance, skewness) across 32 padding byte values.
-        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 2000 to 20 samples
+        // Full statistical depth restored: 32×2000 samples for robust fingerprinting
         {
-            auto sub_results = run_subtest("KL-DEVIATION-FINGERPRINT", 30, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-DEVIATION-FINGERPRINT", 600, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
-                constexpr int DEV_FP_SAMPLES = 20;
+                constexpr int DEV_FP_SAMPLES = 2000;
                 std::map<int, std::vector<double>> dists;
                 for (int bv = 0; bv < 256; bv += 8) {
                     std::string probe = safe_passphrase(bv);
@@ -51114,11 +51113,11 @@ public:
         // NOVELTY DECLARATION — KL-ENTROPY-GRADIENT
         // Uses ADAPTIVE ENTROPY GRADIENT: measures Shannon entropy of timing
         // samples per padding byte, detects if entropy correlates with validity.
-        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 1000 to 10 samples
+        // Full statistical depth restored: 16×1000 samples for robust gradient detection
         {
-            auto sub_results = run_subtest("KL-ENTROPY-GRADIENT", 30, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-ENTROPY-GRADIENT", 600, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
-                constexpr int ENT_GRAD_SAMPLES = 10;
+                constexpr int ENT_GRAD_SAMPLES = 1000;
                 auto shannon = [](const std::vector<double>& v, int bins) -> double {
                     std::vector<int> h(bins,0);
                     double mn=*std::min_element(v.begin(),v.end());
@@ -51163,17 +51162,17 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 1800s watchdog warning (continuing)");
         }
 
         // ================================================================
         // NOVEL METHOD – not based on existing public research
         // KL-NOVEL-RPC-TIMING-ENTROPY: Timing distribution analysis for
         // key-related vs non-key RPCs.
-        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 50 to 10 samples
+        // Full statistical depth restored: 50×6 samples for robust entropy comparison
         // ================================================================
         {
-            auto sub_results = run_subtest("KL-NOVEL-RPC-TIMING-ENTROPY", 30, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-NOVEL-RPC-TIMING-ENTROPY", 300, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-NOVEL-RPC-TIMING-ENTROPY — timing distribution analysis");
@@ -51190,7 +51189,7 @@ public:
                     return std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
                 };
 
-                constexpr int RPC_TIMING_SAMPLES = 10;
+                constexpr int RPC_TIMING_SAMPLES = 50;
                 for (int i = 0; i < RPC_TIMING_SAMPLES; i++) {
                     for (const auto& m : key_rpcs)
                         key_rpc_times.push_back(measure_rpc(m));
@@ -51363,7 +51362,7 @@ public:
         // KL ENGINE WATCHDOG CHECK — non-fatal, continues execution
         if (kl_engine_expired()) {
             EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": KL-ENGINE-WATCHDOG — 120s watchdog warning (continuing)");
+                ver + ": KL-ENGINE-WATCHDOG — 1800s watchdog warning (continuing)");
         }
 
         // METHOD 1 (FIXED): KL-PAD-SEMANTIC — Real Error Fingerprint Analysis
@@ -51835,16 +51834,16 @@ public:
 
         // ================================================================
         // NOVEL METHOD — KL-PAD-NOVEL-FAULT-INJECTION
-        // FIX: Reduced from 100 to 10 rounds; wrapped in run_subtest
+        // Full statistical depth restored: 100×2 rounds for robust fault injection detection
         // ================================================================
         // NOVEL METHOD
         if (have_wallet && inst.bitcoind_pid > 0) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-FAULT-INJECTION", 30, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-FAULT-INJECTION", 300, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                 ver + ": KL-PAD-NOVEL-FAULT-INJECTION — signal-based fault injection oracle");
             std::vector<double> fault_timings_valid, fault_timings_invalid;
-            for (int round = 0; round < 10; round++) {
+            for (int round = 0; round < 100; round++) {
                 // Valid-shaped passphrase (PKCS7 padding byte 0x01)
                 std::string valid_pass = safe_passphrase(0x01);
                 // Invalid-shaped passphrase (non-PKCS7 byte 0xFF)
@@ -51886,7 +51885,7 @@ public:
                 std::string(": Fault injection oracle t=") + std::to_string(fi_t).substr(0, 6) +
                 " mean_valid=" + std::to_string(fi_mean_v).substr(0, 10) +
                 " mean_invalid=" + std::to_string(fi_mean_i).substr(0, 10),
-                "n=10 signal=SIGURG t_stat=" + std::to_string(fi_t),
+                "n=100 signal=SIGURG t_stat=" + std::to_string(fi_t),
                 fi_detected ? 7 : 0));
                 return sub;
             });
@@ -51899,11 +51898,11 @@ public:
 
         // ================================================================
         // NOVEL METHOD — KL-PAD-NOVEL-MICROARCH-CONTENTION
-        // FIX: Wrapped in run_subtest with 30s deadline; reduced from 200 to 20 rounds
+        // Full statistical depth restored: 200×2 rounds for robust contention detection
         // ================================================================
         // NOVEL METHOD
         if (have_wallet) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-MICROARCH-CONTENTION", 30, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-MICROARCH-CONTENTION", 300, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                 ver + ": KL-PAD-NOVEL-MICROARCH-CONTENTION — context switch contention oracle");
@@ -51925,7 +51924,7 @@ public:
                 return vol;
             };
             std::vector<long> csw_valid, csw_invalid;
-            for (int round = 0; round < 20; round++) {
+            for (int round = 0; round < 200; round++) {
                 long before = read_ctx_switches();
                 rpc_fast(inst, "walletpassphrase", "[\"" + safe_passphrase(0x01) + "\", 1]");
                 long after = read_ctx_switches();
@@ -51956,7 +51955,7 @@ public:
                 std::string(": Context switch contention t=") + std::to_string(csw_t).substr(0, 6) +
                 " csw_mean_valid=" + std::to_string(csw_mean_v).substr(0, 8) +
                 " csw_mean_invalid=" + std::to_string(csw_mean_i).substr(0, 8),
-                "n=20 metric=voluntary_ctxt_switches t_stat=" + std::to_string(csw_t),
+                "n=200 metric=voluntary_ctxt_switches t_stat=" + std::to_string(csw_t),
                 csw_detected ? 6 : 0));
                 return sub;
             });
