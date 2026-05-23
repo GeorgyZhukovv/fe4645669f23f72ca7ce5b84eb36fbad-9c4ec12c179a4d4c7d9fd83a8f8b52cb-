@@ -43153,19 +43153,48 @@ public:
              {"rpc_port",   std::to_string(instance.rpc_port)}});
 
         // ── Create wallet for versions that need it (0.21+) ───────────────
+        // For v23+, descriptor wallets are default. Explicitly create a legacy
+        // wallet (descriptors=false) so mining addresses are always spendable.
         {
-            std::string cw = cli_path +
-                " -regtest"
-                " -datadir='" + instance.data_directory + "'"
-                " -rpcuser="    + instance.rpc_user +
-                " -rpcpassword=" + instance.rpc_password +
-                " -rpcport="    + std::to_string(instance.rpc_port) +
-                " createwallet audit 2>/dev/null";
-            if (system(cw.c_str()) == 0) {
+            // Detect if this is v23+ (descriptor wallet default)
+            int eff_ver = 0;
+            {
+                std::vector<int> vparts;
+                std::istringstream viss(instance.version_string);
+                std::string vtok;
+                while (std::getline(viss, vtok, '.')) {
+                    try { vparts.push_back(std::stoi(vtok)); } catch (...) { vparts.push_back(0); }
+                }
+                if (!vparts.empty()) eff_ver = (vparts[0] == 0 && vparts.size() >= 2) ? vparts[1] : vparts[0];
+            }
+
+            std::string cw_cmd;
+            if (eff_ver >= 23) {
+                // createwallet "audit" false false "" false false
+                // params: name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors
+                // Setting descriptors=false forces a legacy BDB wallet
+                cw_cmd = cli_path +
+                    " -regtest"
+                    " -datadir='" + instance.data_directory + "'"
+                    " -rpcuser="    + instance.rpc_user +
+                    " -rpcpassword=" + instance.rpc_password +
+                    " -rpcport="    + std::to_string(instance.rpc_port) +
+                    " createwallet audit false false \"\" false false 2>/dev/null";
+            } else {
+                cw_cmd = cli_path +
+                    " -regtest"
+                    " -datadir='" + instance.data_directory + "'"
+                    " -rpcuser="    + instance.rpc_user +
+                    " -rpcpassword=" + instance.rpc_password +
+                    " -rpcport="    + std::to_string(instance.rpc_port) +
+                    " createwallet audit 2>/dev/null";
+            }
+            if (system(cw_cmd.c_str()) == 0) {
                 instance.wallet_name = "audit";
                 EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG,
                     "version_manager",
-                    "Created wallet 'audit' for " + instance.version_string);
+                    "Created wallet 'audit' for " + instance.version_string +
+                    (eff_ver >= 23 ? " (legacy, descriptors=false)" : ""));
             }
         }
 
@@ -45922,11 +45951,72 @@ private:
         return {ver, cat, id + "-" + ver, desc, steps, "", true, severity, {"regtest"}, "", ""};
     }
 
+    // Parse major.minor version from version_string (e.g. "23.0" -> {23,0}, "0.21.1" -> {0,21})
+    static std::pair<int,int> parse_version_pair(const std::string& vs) {
+        // Handle both "X.Y" and "0.X.Y" formats
+        std::vector<int> parts;
+        std::istringstream iss(vs);
+        std::string tok;
+        while (std::getline(iss, tok, '.')) {
+            try { parts.push_back(std::stoi(tok)); } catch (...) { parts.push_back(0); }
+        }
+        if (parts.empty()) return {0, 0};
+        if (parts[0] == 0 && parts.size() >= 2) return {0, parts[1]}; // "0.21.1" -> {0,21}
+        return {parts[0], parts.size() >= 2 ? parts[1] : 0};          // "23.0" -> {23,0}
+    }
+
+    // Effective major version: "0.21" -> 21, "23.0" -> 23
+    static int effective_major(const std::string& vs) {
+        auto [maj, min] = parse_version_pair(vs);
+        return (maj == 0) ? min : maj;
+    }
+
+    // Check if this version uses descriptor wallets by default (>= 23.0)
+    static bool is_descriptor_wallet_default(const std::string& vs) {
+        return effective_major(vs) >= 23;
+    }
+
     // Ensure wallet is usable across ALL versions (0.16.3 through 31.0)
+    // For >= 23.0, descriptor wallets are default; we explicitly create a
+    // legacy wallet to ensure mining addresses are spendable without
+    // descriptor import gymnastics.
     bool ensure_wallet_universal(VersionInstance& inst) {
+        int eff_ver = effective_major(inst.version_string);
+
         // Test 1: already have a wallet?
         auto wi = rpc(inst, "getwalletinfo");
-        if (wi.success && !wi.is_error()) return true;
+        if (wi.success && !wi.is_error()) {
+            // For v23+, check if this is a descriptor wallet.  If so, the
+            // mining address may not be spendable.  Prefer creating a fresh
+            // legacy wallet instead.
+            bool is_desc = wi.has("\"descriptors\": true") || wi.has("\"descriptors\":true");
+            if (is_desc && eff_ver >= 23) {
+                EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                    "setup", inst.version_string +
+                    ": existing wallet is descriptor-based — creating legacy wallet for mining");
+                // Try creating a legacy wallet with descriptors=false
+                // createwallet params: name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup
+                auto cw = rpc(inst, "createwallet", "\"audit_legacy\" false false \"\" false false");
+                if (cw.success && !cw.is_error()) {
+                    inst.wallet_name = "audit_legacy";
+                    EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                        "setup", inst.version_string + ": created legacy wallet 'audit_legacy'");
+                    return true;
+                }
+                // If that failed, try with descriptors=false as 7th param (v24+ format)
+                cw = rpc(inst, "createwallet", "\"audit_legacy\" false false \"\" false false true");
+                if (cw.success && !cw.is_error()) {
+                    inst.wallet_name = "audit_legacy";
+                    return true;
+                }
+                // Fall through — use the existing descriptor wallet and handle it in setup_chain
+                EnhancedStructuredLogger::instance()->log(LogLevel::WARNING,
+                    "setup", inst.version_string +
+                    ": could not create legacy wallet — will use descriptor wallet with import fallback");
+                return true;
+            }
+            return true;
+        }
 
         // Test 2: listwallets and load first available
         auto lw = rpc(inst, "listwallets");
@@ -45936,7 +46026,19 @@ private:
             if (wi.success && !wi.is_error()) return true;
         }
 
-        // Test 3: createwallet (0.17+)
+        // Test 3: For v23+, explicitly create a LEGACY wallet (descriptors=false)
+        if (eff_ver >= 23) {
+            auto cw = rpc(inst, "createwallet", "\"audit\" false false \"\" false false");
+            if (cw.success && !cw.is_error()) {
+                inst.wallet_name = "audit";
+                EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                    "setup", inst.version_string + ": created legacy wallet 'audit' (descriptors=false)");
+                wi = rpc(inst, "getwalletinfo");
+                if (wi.success && !wi.is_error()) return true;
+            }
+        }
+
+        // Test 4: createwallet (0.17+) — default params
         auto cw = rpc(inst, "createwallet", "\"audit\"");
         if (cw.success && !cw.is_error()) {
             inst.wallet_name = "audit";
@@ -45944,7 +46046,7 @@ private:
             if (wi.success && !wi.is_error()) return true;
         }
 
-        // Test 4: createwallet with extra params for descriptor wallets (0.21+)
+        // Test 5: createwallet with extra params for descriptor wallets (0.21+)
         cw = rpc(inst, "createwallet", "\"audit\" false false \"\" false false");
         if (cw.success && !cw.is_error()) {
             inst.wallet_name = "audit";
@@ -45952,7 +46054,7 @@ private:
             if (wi.success && !wi.is_error()) return true;
         }
 
-        // Test 5: For 0.16.x, wallet is always loaded by default
+        // Test 6: For 0.16.x, wallet is always loaded by default
         // The RPC may just be slow; try again
         std::this_thread::sleep_for(std::chrono::seconds(2));
         wi = rpc(inst, "getwalletinfo");
@@ -45961,28 +46063,246 @@ private:
         return false;
     }
 
-    // Generate mature UTXOs using chain-derived address
-    std::string setup_chain(VersionInstance& inst, int blocks = 110) {
-        auto r = rpc(inst, "getnewaddress");
-        // FIX: rpc() → rpc_fast() returns JSON-RPC body, e.g.
-        //   {"result":"bcrt1q...","error":null,"id":"f"}
-        // We must extract the scalar "result" value, not use r.output directly —
-        // using r.output would fail the alnum validation below and return "" every time,
-        // which is why no blocks were ever mined and height stayed at 0.
-        std::string addr = (r.success && !r.is_error()) ? r.result() : "";
-        EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG,
-            "setup", "getnewaddress for " + inst.version_string +
-            ": ok=" + std::to_string(r.success) +
-            " addr='" + addr.substr(0, 60) + "'");
-        if (addr.empty() || addr.size() < 10 || addr.size() > 100) return "";
-        // Trim and validate — bitcoin addresses are strictly alphanumeric
+    // Validate and trim a bitcoin address string
+    static std::string validate_address(const std::string& raw) {
+        std::string addr = raw;
         while (!addr.empty() && (addr.back() == '\n' || addr.back() == '\r' || addr.back() == ' '))
             addr.pop_back();
+        if (addr.empty() || addr.size() < 10 || addr.size() > 100) return "";
         for (char c : addr) if (!std::isalnum(c)) return "";
+        return addr;
+    }
+
+    // Count spendable UTXOs via listunspent
+    int count_spendable_utxos(const VersionInstance& inst) {
+        auto utxo_raw = rpc(inst, "listunspent", "1 9999999");
+        if (!utxo_raw.success || utxo_raw.is_error()) return 0;
+        int count = 0;
+        size_t pos = 0;
+        while ((pos = utxo_raw.output.find("\"spendable\"", pos)) != std::string::npos) {
+            // Check if spendable is true
+            size_t val_start = utxo_raw.output.find(':', pos);
+            if (val_start != std::string::npos) {
+                std::string after = utxo_raw.output.substr(val_start + 1, 20);
+                if (after.find("true") != std::string::npos) count++;
+            }
+            pos += 11;
+        }
+        return count;
+    }
+
+    // Verify address is controlled by wallet (ismine check)
+    bool verify_address_ismine(const VersionInstance& inst, const std::string& addr) {
+        auto info = rpc(inst, "getaddressinfo", "\"" + addr + "\"");
+        if (!info.success || info.is_error()) return false;
+        // Check ismine field
+        if (info.has("\"ismine\": true") || info.has("\"ismine\":true")) return true;
+        // For older versions, check iswatchonly=false as proxy
+        if (info.has("\"iswatchonly\": false") || info.has("\"iswatchonly\":false")) {
+            // If it's not watch-only and the wallet knows about it, it's ours
+            if (info.has("\"address\"")) return true;
+        }
+        return false;
+    }
+
+    // Import a mining address descriptor into a descriptor wallet
+    bool import_mining_descriptor(const VersionInstance& inst, const std::string& addr) {
+        // Get descriptor info for the address
+        auto addr_info = rpc(inst, "getaddressinfo", "\"" + addr + "\"");
+        if (!addr_info.success || addr_info.is_error()) return false;
+
+        // Extract the descriptor from address info
+        std::string desc = jx(addr_info.output, "desc");
+        if (desc.empty()) return false;
+
+        // Get canonical descriptor with checksum
+        auto desc_info = rpc(inst, "getdescriptorinfo", "\"" + desc + "\"");
+        if (!desc_info.success || desc_info.is_error()) return false;
+        std::string canonical = jx(desc_info.output, "descriptor");
+        if (canonical.empty()) canonical = desc;
+
+        // Import via importdescriptors
+        std::string import_json = "[{\"desc\":\"" + canonical +
+            "\",\"timestamp\":\"now\",\"internal\":false,\"active\":true}]";
+        auto imp = rpc(inst, "importdescriptors", "'" + import_json + "'");
+        if (imp.success && !imp.is_error()) {
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                "setup", inst.version_string + ": imported mining descriptor for " + addr);
+            return true;
+        }
+        return false;
+    }
+
+    // Generate mature UTXOs using chain-derived address
+    // Enhanced for v23+: handles descriptor wallets, verifies address ownership,
+    // performs fallback mining loop, and rescan if needed.
+    std::string setup_chain(VersionInstance& inst, int blocks = 110) {
+        int eff_ver = effective_major(inst.version_string);
+        std::string addr;
+
+        // Step 1: Generate mining address
+        // For v23+ descriptor wallets, try legacy address first for reliability
+        if (eff_ver >= 23) {
+            // Try generating a legacy address — more reliable for mining
+            auto r = rpc(inst, "getnewaddress", "\"mining\" \"legacy\"");
+            addr = (r.success && !r.is_error()) ? r.result() : "";
+            addr = validate_address(addr);
+            if (addr.empty()) {
+                // Legacy might not be available; try default
+                r = rpc(inst, "getnewaddress");
+                addr = (r.success && !r.is_error()) ? r.result() : "";
+                addr = validate_address(addr);
+            }
+        } else {
+            auto r = rpc(inst, "getnewaddress");
+            addr = (r.success && !r.is_error()) ? r.result() : "";
+            addr = validate_address(addr);
+        }
+
+        EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG,
+            "setup", "getnewaddress for " + inst.version_string +
+            ": addr='" + addr.substr(0, std::min(addr.size(), (size_t)60)) + "'");
+        if (addr.empty()) return "";
+
+        // Step 2: Verify address is controlled by wallet (ismine check)
+        if (eff_ver >= 17) {
+            bool ismine = verify_address_ismine(inst, addr);
+            EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG,
+                "setup", inst.version_string + ": address ismine=" +
+                std::string(ismine ? "true" : "false") + " addr=" + addr);
+            if (!ismine && eff_ver >= 23) {
+                // Descriptor wallet may not recognize the address — try importing
+                EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                    "setup", inst.version_string +
+                    ": mining address not ismine — attempting descriptor import");
+                import_mining_descriptor(inst, addr);
+                // Re-check
+                ismine = verify_address_ismine(inst, addr);
+                if (!ismine) {
+                    // Last resort: try a legacy address
+                    auto r2 = rpc(inst, "getnewaddress", "\"mining_fallback\" \"legacy\"");
+                    std::string addr2 = (r2.success && !r2.is_error()) ? r2.result() : "";
+                    addr2 = validate_address(addr2);
+                    if (!addr2.empty()) {
+                        EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                            "setup", inst.version_string +
+                            ": falling back to legacy address: " + addr2);
+                        addr = addr2;
+                    }
+                }
+            }
+        }
+
+        // Step 3: Mine initial blocks
         auto gen = rpc(inst, "generatetoaddress", std::to_string(blocks) + " " + addr);
         EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG,
             "setup", "generatetoaddress " + std::to_string(blocks) + " for " +
             inst.version_string + ": ok=" + std::to_string(gen.success));
+
+        // Step 4: Verify chain height reached expected value
+        {
+            auto bci = rpc(inst, "getblockchaininfo");
+            if (bci.success) {
+                std::string height_str = jx(bci.output, "blocks");
+                EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG,
+                    "setup", inst.version_string + ": chain height after mining = " + height_str);
+            }
+        }
+
+        // Step 5: Check wallet txcount — if transactions present but UTXOs=0,
+        // coins may be immature or address not recognized
+        {
+            auto wi = rpc(inst, "getwalletinfo");
+            if (wi.success && !wi.is_error()) {
+                double txcount = jx_num(wi.output, "txcount");
+                bool is_desc = wi.has("\"descriptors\": true") || wi.has("\"descriptors\":true");
+                EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG,
+                    "setup", inst.version_string + ": wallet txcount=" +
+                    std::to_string((int)txcount) + " descriptors=" +
+                    std::string(is_desc ? "true" : "false"));
+
+                if (txcount > 0 && is_desc && eff_ver >= 23) {
+                    // Descriptor wallet with transactions but possibly no spendable UTXOs
+                    // Try rescanblockchain to sync wallet state
+                    EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                        "setup", inst.version_string +
+                        ": descriptor wallet has txcount=" + std::to_string((int)txcount) +
+                        " — running rescanblockchain");
+                    rpc(inst, "rescanblockchain");
+                }
+            }
+        }
+
+        // Step 6: Fallback mining loop — if listunspent returns < 10 spendable UTXOs,
+        // mine additional blocks in increments of 10 (up to 200 extra)
+        int utxo_count = count_spendable_utxos(inst);
+        EnhancedStructuredLogger::instance()->log(LogLevel::DEBUG,
+            "setup", inst.version_string + ": initial spendable UTXOs = " +
+            std::to_string(utxo_count));
+
+        if (utxo_count < 10) {
+            int extra_mined = 0;
+            const int MAX_EXTRA = 200;
+            const int BATCH = 10;
+
+            while (utxo_count < 10 && extra_mined < MAX_EXTRA) {
+                EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                    "setup", inst.version_string + ": UTXOs=" +
+                    std::to_string(utxo_count) + " < 10 — mining " +
+                    std::to_string(BATCH) + " more blocks (extra_mined=" +
+                    std::to_string(extra_mined) + ")");
+                rpc(inst, "generatetoaddress", std::to_string(BATCH) + " " + addr);
+                extra_mined += BATCH;
+
+                // For descriptor wallets, rescan after each batch
+                if (eff_ver >= 23) {
+                    rpc(inst, "rescanblockchain");
+                }
+
+                utxo_count = count_spendable_utxos(inst);
+            }
+
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                "setup", inst.version_string + ": after fallback mining: UTXOs=" +
+                std::to_string(utxo_count) + " extra_blocks=" +
+                std::to_string(extra_mined));
+        }
+
+        // Step 7: If still no UTXOs on descriptor wallet, try full rescan + legacy fallback
+        if (utxo_count < 10 && eff_ver >= 23) {
+            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING,
+                "setup", inst.version_string +
+                ": still < 10 UTXOs after fallback mining — attempting legacy wallet creation");
+
+            // Try creating a separate legacy wallet for mining
+            auto cw = rpc(inst, "createwallet", "\"mining_legacy\" false false \"\" false false");
+            if (cw.success && !cw.is_error()) {
+                std::string saved_wallet = inst.wallet_name;
+                inst.wallet_name = "mining_legacy";
+
+                auto r = rpc(inst, "getnewaddress", "\"mine\" \"legacy\"");
+                std::string legacy_addr = (r.success && !r.is_error()) ? r.result() : "";
+                legacy_addr = validate_address(legacy_addr);
+
+                if (!legacy_addr.empty()) {
+                    rpc(inst, "generatetoaddress", "110 " + legacy_addr);
+                    utxo_count = count_spendable_utxos(inst);
+                    EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                        "setup", inst.version_string +
+                        ": legacy wallet mining result: UTXOs=" + std::to_string(utxo_count));
+                    if (utxo_count >= 10) {
+                        addr = legacy_addr;
+                        // Keep using the legacy wallet
+                    } else {
+                        // Revert to original wallet
+                        inst.wallet_name = saved_wallet;
+                    }
+                } else {
+                    inst.wallet_name = saved_wallet;
+                }
+            }
+        }
+
         return addr;
     }
 
@@ -56065,12 +56385,62 @@ public:
             // 4. NOW derive chain params (with height=110, UTXOs populated)
             auto params = ChainParameterEngine::derive(*inst);
 
-            // Validate params are usable
-            if (params.current_height == 0 || params.utxos.empty()) {
+            // 4b. UTXO verification with fallback — critical for v23+ descriptor wallets
+            if (params.spendable_utxo_count < 10 && have_wallet && !mining_addr.empty()) {
                 EnhancedStructuredLogger::instance()->log(LogLevel::WARNING,
-                    "pipeline", "  " + version + ": params incomplete (height=" +
-                    std::to_string(params.current_height) + " utxos=" +
-                    std::to_string(params.utxos.size()) + ") — tests may be limited");
+                    "pipeline", "  " + version + ": only " +
+                    std::to_string(params.spendable_utxo_count) +
+                    " spendable UTXOs — running post-derive fallback");
+
+                // Rescan blockchain to pick up any missed coinbase rewards
+                deep_engine.rpc_public(*inst, "rescanblockchain");
+
+                // Mine additional blocks in batches of 10 up to 200 extra
+                int extra_mined = 0;
+                const int MAX_EXTRA = 200;
+                while (params.spendable_utxo_count < 10 && extra_mined < MAX_EXTRA) {
+                    deep_engine.rpc_public(*inst, "generatetoaddress",
+                        "10 " + mining_addr);
+                    extra_mined += 10;
+                    params = ChainParameterEngine::derive(*inst);
+                }
+
+                if (params.spendable_utxo_count >= 10) {
+                    EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                        "pipeline", "  " + version + ": UTXO fallback succeeded — " +
+                        std::to_string(params.spendable_utxo_count) +
+                        " UTXOs after " + std::to_string(extra_mined) + " extra blocks");
+                }
+            }
+
+            // Validate params are usable
+            if (params.current_height == 0 || params.spendable_utxo_count == 0) {
+                if (params.spendable_utxo_count == 0 && have_wallet) {
+                    // Emit SETUP-UTXO-FAILURE finding (severity Critical)
+                    VersionInstanceManager::DynamicFinding utxo_fail;
+                    utxo_fail.version = version;
+                    utxo_fail.category = "setup";
+                    utxo_fail.finding_id = "SETUP-UTXO-FAILURE-" + version;
+                    utxo_fail.description = "UTXO setup failed for " + version +
+                        ": wallet loaded but listunspent returns 0 spendable UTXOs. "
+                        "Height=" + std::to_string(params.current_height) +
+                        " wallet=" + std::string(params.wallet_available ? "YES" : "NO");
+                    utxo_fail.replication_steps = "createwallet -> getnewaddress -> generatetoaddress 110 "
+                        "-> rescanblockchain -> listunspent = 0 spendable";
+                    utxo_fail.is_reproducible = true;
+                    utxo_fail.severity = 0; // Critical
+                    utxo_fail.affected_configurations = {"regtest"};
+                    dynamic_findings_.push_back(utxo_fail);
+                    inst_mgr.add_finding(utxo_fail);
+                    EnhancedStructuredLogger::instance()->log(LogLevel::ERROR,
+                        "pipeline", "  " + version +
+                        ": SETUP-UTXO-FAILURE (Critical) — version recorded as incomplete");
+                } else {
+                    EnhancedStructuredLogger::instance()->log(LogLevel::WARNING,
+                        "pipeline", "  " + version + ": params incomplete (height=" +
+                        std::to_string(params.current_height) + " utxos=" +
+                        std::to_string(params.spendable_utxo_count) + ") — tests may be limited");
+                }
             }
 
             int bridge_count = 0, deep_count = 0, fuzz_count = 0, cov_count = 0;
@@ -62994,12 +63364,62 @@ public:
             // 4. NOW derive chain params (with height=110, UTXOs populated)
             auto params = ChainParameterEngine::derive(*inst);
 
-            // Validate params are usable
-            if (params.current_height == 0 || params.utxos.empty()) {
+            // 4b. UTXO verification with fallback — critical for v23+ descriptor wallets
+            if (params.spendable_utxo_count < 10 && have_wallet && !mining_addr.empty()) {
                 EnhancedStructuredLogger::instance()->log(LogLevel::WARNING,
-                    "pipeline", "  " + version + ": params incomplete (height=" +
-                    std::to_string(params.current_height) + " utxos=" +
-                    std::to_string(params.utxos.size()) + ") — tests may be limited");
+                    "pipeline", "  " + version + ": only " +
+                    std::to_string(params.spendable_utxo_count) +
+                    " spendable UTXOs — running post-derive fallback");
+
+                // Rescan blockchain to pick up any missed coinbase rewards
+                deep_engine.rpc_public(*inst, "rescanblockchain");
+
+                // Mine additional blocks in batches of 10 up to 200 extra
+                int extra_mined = 0;
+                const int MAX_EXTRA = 200;
+                while (params.spendable_utxo_count < 10 && extra_mined < MAX_EXTRA) {
+                    deep_engine.rpc_public(*inst, "generatetoaddress",
+                        "10 " + mining_addr);
+                    extra_mined += 10;
+                    params = ChainParameterEngine::derive(*inst);
+                }
+
+                if (params.spendable_utxo_count >= 10) {
+                    EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                        "pipeline", "  " + version + ": UTXO fallback succeeded — " +
+                        std::to_string(params.spendable_utxo_count) +
+                        " UTXOs after " + std::to_string(extra_mined) + " extra blocks");
+                }
+            }
+
+            // Validate params are usable
+            if (params.current_height == 0 || params.spendable_utxo_count == 0) {
+                if (params.spendable_utxo_count == 0 && have_wallet) {
+                    // Emit SETUP-UTXO-FAILURE finding (severity Critical)
+                    VersionInstanceManager::DynamicFinding utxo_fail;
+                    utxo_fail.version = version;
+                    utxo_fail.category = "setup";
+                    utxo_fail.finding_id = "SETUP-UTXO-FAILURE-" + version;
+                    utxo_fail.description = "UTXO setup failed for " + version +
+                        ": wallet loaded but listunspent returns 0 spendable UTXOs. "
+                        "Height=" + std::to_string(params.current_height) +
+                        " wallet=" + std::string(params.wallet_available ? "YES" : "NO");
+                    utxo_fail.replication_steps = "createwallet -> getnewaddress -> generatetoaddress 110 "
+                        "-> rescanblockchain -> listunspent = 0 spendable";
+                    utxo_fail.is_reproducible = true;
+                    utxo_fail.severity = 0; // Critical
+                    utxo_fail.affected_configurations = {"regtest"};
+                    dynamic_findings_.push_back(utxo_fail);
+                    inst_mgr.add_finding(utxo_fail);
+                    EnhancedStructuredLogger::instance()->log(LogLevel::ERROR,
+                        "pipeline", "  " + version +
+                        ": SETUP-UTXO-FAILURE (Critical) — version recorded as incomplete");
+                } else {
+                    EnhancedStructuredLogger::instance()->log(LogLevel::WARNING,
+                        "pipeline", "  " + version + ": params incomplete (height=" +
+                        std::to_string(params.current_height) + " utxos=" +
+                        std::to_string(params.spendable_utxo_count) + ") — tests may be limited");
+                }
             }
 
             int bridge_count = 0, deep_count = 0, fuzz_count = 0, cov_count = 0;
