@@ -46017,27 +46017,19 @@ private:
             // Check for archives (.tar.gz) or pre-extracted directories (bitcoin-*)
             std::string check_cmd = "ls -d " + dynamic_config_.osx_archive_directory +
                 "/bitcoin-*/bin/bitcoind 2>/dev/null | wc -l";
-            FILE* pipe = popen(check_cmd.c_str(), "r");
+            PopenResult dir_pr = popen_with_timeout(check_cmd, 10);
             int dir_count = 0;
-            if (pipe) {
-                char buf[32];
-                if (fgets(buf, sizeof(buf), pipe)) {
-                    dir_count = std::atoi(buf);
-                }
-                pclose(pipe);
+            if (!dir_pr.timed_out && !dir_pr.output.empty()) {
+                dir_count = std::atoi(dir_pr.output.c_str());
             }
 
             // Also check for .tar.gz archives
             std::string check_cmd2 = "ls " + dynamic_config_.osx_archive_directory +
                 "/*.tar.gz 2>/dev/null | wc -l";
-            FILE* pipe2 = popen(check_cmd2.c_str(), "r");
+            PopenResult arch_pr = popen_with_timeout(check_cmd2, 10);
             int archive_count = 0;
-            if (pipe2) {
-                char buf[32];
-                if (fgets(buf, sizeof(buf), pipe2)) {
-                    archive_count = std::atoi(buf);
-                }
-                pclose(pipe2);
+            if (!arch_pr.timed_out && !arch_pr.output.empty()) {
+                archive_count = std::atoi(arch_pr.output.c_str());
             }
 
             int total_count = dir_count + archive_count;
@@ -47497,11 +47489,28 @@ public:
         }
 
         // ENGINE 3: Key Leakage (KL-XPRV-IN-DUMP, KL-RAWHEX, KL-BDB-IV, KL-PADDING-ORACLE, KL-NOVEL-RPC-TIMING-ENTROPY)
+        // HANG FIX: wrap deep_key_leakage in std::async with 120s hard timeout
+        // to guarantee forward progress even if internal timeout checks are bypassed.
         EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
             inst.version_string + ": Testing KL-XPRV-IN-DUMP, KL-RAWHEX-IN-DUMP, KL-BDB-IV-UNIQUE, KL-PADDING-ORACLE-TIMING, KL-NOVEL-RPC-TIMING-ENTROPY");
-        auto kl = deep_key_leakage(inst, params, have_wallet);
-        all.insert(all.end(), kl.begin(), kl.end());
-        log("kl", "KL-* complete", kl.size());
+        {
+            auto kl_future = std::async(std::launch::async, [&]() {
+                return deep_key_leakage(inst, params, have_wallet);
+            });
+            std::vector<DynamicFinding> kl;
+            if (kl_future.wait_for(std::chrono::seconds(120)) == std::future_status::ready) {
+                kl = kl_future.get();
+            } else {
+                EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                    inst.version_string + ": KL-ENGINE-TIMEOUT — deep_key_leakage exceeded 120s hard limit");
+                kl.push_back(make_finding(inst.version_string, "key_leakage",
+                    "KL-ENGINE-TIMEOUT",
+                    "Key leakage engine exceeded 120s hard timeout — forcibly aborted to prevent hang",
+                    "timeout_s=120", 0));
+            }
+            all.insert(all.end(), kl.begin(), kl.end());
+            log("kl", "KL-* complete", kl.size());
+        }
 
         // ENGINE 5: Consensus (CS-DISABLED-OP ×15, CS-WITNESS-V0/V1/V2/V16, CS-CHAIN-SYNCED)
         EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_consensus",
@@ -49726,6 +49735,16 @@ public:
         ScopedProfile prof("E3", "kl_" + inst.version_string);
         std::vector<DynamicFinding> results;
         std::string ver = inst.version_string;
+
+        // GLOBAL KL PHASE TIMEOUT: abort entire engine after 120 seconds
+        static constexpr int KL_ENGINE_TIMEOUT_SECS = 120;
+        auto kl_engine_start = std::chrono::steady_clock::now();
+        auto kl_engine_expired = [&]() -> bool {
+            auto now = std::chrono::steady_clock::now();
+            return std::chrono::duration_cast<std::chrono::seconds>(
+                now - kl_engine_start).count() >= KL_ENGINE_TIMEOUT_SECS;
+        };
+
         if (!have_wallet) {
             results.push_back(make_finding(ver, "key_leakage", "KL-NO-WALLET",
                 "SKIP: Wallet not available", "", 0));
@@ -50210,11 +50229,9 @@ public:
             std::string crash_dir = std::string(getenv("HOME") ? getenv("HOME") : "/tmp") +
                 "/Library/Logs/DiagnosticReports";
             std::string check_cmd = "ls -t " + crash_dir + "/bitcoind*.ips 2>/dev/null | head -1";
-            FILE* cp = popen(check_cmd.c_str(), "r");
-            if (cp) {
-                std::string cout; char buf[4096];
-                while (fgets(buf, sizeof(buf), cp)) cout += buf;
-                pclose(cp);
+            PopenResult crash_pr = popen_with_timeout(check_cmd, 5);
+            if (!crash_pr.timed_out) {
+                std::string cout = crash_pr.output;
                 while (!cout.empty() && (cout.back() == '\n' || cout.back() == '\r')) cout.pop_back();
                 if (!cout.empty()) {
                     results.push_back(make_finding(ver, "key_leakage", "KL-CRASH-REPORT-EXISTS",
@@ -50589,6 +50606,19 @@ public:
         // ENGINE 3 DEEP: PADDING ORACLE DISCOVERY — 6 oracle types
         // ================================================================
 
+        // KL ENGINE TIMEOUT CHECK — abort if 120s exceeded
+        if (kl_engine_expired()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - kl_engine_start).count();
+            results.push_back(make_finding(ver, "key_leakage", "KL-ENGINE-TIMEOUT",
+                "Key leakage engine exceeded " + std::to_string(KL_ENGINE_TIMEOUT_SECS) +
+                "s global timeout after " + std::to_string(elapsed) + "s — aborting remaining sub-tests",
+                "elapsed_s=" + std::to_string(elapsed), 0));
+            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                ver + ": KL-ENGINE-TIMEOUT at " + std::to_string(elapsed) + "s — skipping remaining sub-tests");
+            return results;
+        }
+
         // TYPE 2: Error message padding oracle — test 256 last-byte values
         // NOVELTY DECLARATION — KL-PADDING-ERROR-DISTINCTION
         // Tests if walletpassphrase error messages vary by padding byte
@@ -50651,6 +50681,16 @@ public:
                     "PASS: Uniform return code across all passphrase variants", "", 0));
         }
 
+        // KL ENGINE TIMEOUT CHECK
+        if (kl_engine_expired()) {
+            results.push_back(make_finding(ver, "key_leakage", "KL-ENGINE-TIMEOUT",
+                "Key leakage engine exceeded " + std::to_string(KL_ENGINE_TIMEOUT_SECS) +
+                "s global timeout — aborting remaining sub-tests", "", 0));
+            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                ver + ": KL-ENGINE-TIMEOUT — skipping remaining sub-tests");
+            return results;
+        }
+
         // TYPE 1 ENHANCED: High-iteration timing oracle with t-test
         // NOVELTY DECLARATION — KL-PADDING-TIMING-DEEP
         // 10,000 iterations (2 groups: valid-padding-shaped vs invalid)
@@ -50695,6 +50735,16 @@ public:
                 " mean_invalid=" + std::to_string(mean_i) + " n=5000"),
                 "t_stat=" + std::to_string(t_stat) + " p<" + (significant ? "0.001" : "ns"),
                 significant ? 7 : 0));
+        }
+
+        // KL ENGINE TIMEOUT CHECK
+        if (kl_engine_expired()) {
+            results.push_back(make_finding(ver, "key_leakage", "KL-ENGINE-TIMEOUT",
+                "Key leakage engine exceeded " + std::to_string(KL_ENGINE_TIMEOUT_SECS) +
+                "s global timeout — aborting remaining sub-tests", "", 0));
+            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                ver + ": KL-ENGINE-TIMEOUT — skipping remaining sub-tests");
+            return results;
         }
 
         // TYPE 5: Memory scan after walletlock — SIP-compatible multi-method approach
@@ -50884,6 +50934,16 @@ public:
             }
         }
 
+        // KL ENGINE TIMEOUT CHECK
+        if (kl_engine_expired()) {
+            results.push_back(make_finding(ver, "key_leakage", "KL-ENGINE-TIMEOUT",
+                "Key leakage engine exceeded " + std::to_string(KL_ENGINE_TIMEOUT_SECS) +
+                "s global timeout — aborting remaining sub-tests", "", 0));
+            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                ver + ": KL-ENGINE-TIMEOUT — skipping remaining sub-tests");
+            return results;
+        }
+
         // ================================================================
         // ENGINE 3 DEEP: KL-PADDING-EXPLOIT — Lucky13 decryption attempt
         // NOVELTY DECLARATION: Attempts to extract master key via padding oracle
@@ -50968,6 +51028,16 @@ public:
                     }
                 }
             }
+        }
+
+        // KL ENGINE TIMEOUT CHECK
+        if (kl_engine_expired()) {
+            results.push_back(make_finding(ver, "key_leakage", "KL-ENGINE-TIMEOUT",
+                "Key leakage engine exceeded " + std::to_string(KL_ENGINE_TIMEOUT_SECS) +
+                "s global timeout — aborting remaining sub-tests", "", 0));
+            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                ver + ": KL-ENGINE-TIMEOUT — skipping remaining sub-tests");
+            return results;
         }
 
         // NOVELTY DECLARATION — KL-DEVIATION-FINGERPRINT
@@ -51065,6 +51135,16 @@ public:
                 "ent_min=" + std::to_string(emn) + " ent_max=" + std::to_string(emx) +
                 (attribution.oracle_detected ? " call_site=" + attribution.call_site_signature : ""),
                 er>1.5 ? 7 : 0));
+        }
+
+        // KL ENGINE TIMEOUT CHECK
+        if (kl_engine_expired()) {
+            results.push_back(make_finding(ver, "key_leakage", "KL-ENGINE-TIMEOUT",
+                "Key leakage engine exceeded " + std::to_string(KL_ENGINE_TIMEOUT_SECS) +
+                "s global timeout — aborting remaining sub-tests", "", 0));
+            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                ver + ": KL-ENGINE-TIMEOUT — skipping remaining sub-tests");
+            return results;
         }
 
         // ================================================================
@@ -51263,6 +51343,16 @@ public:
         // HYBRID NOVELTY: KL Padding Oracle — 5 Methods
         // 2 Traditional-Evolved + 3 Completely Novel
         // ================================================================
+
+        // KL ENGINE TIMEOUT CHECK
+        if (kl_engine_expired()) {
+            results.push_back(make_finding(ver, "key_leakage", "KL-ENGINE-TIMEOUT",
+                "Key leakage engine exceeded " + std::to_string(KL_ENGINE_TIMEOUT_SECS) +
+                "s global timeout — aborting remaining sub-tests", "", 0));
+            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                ver + ": KL-ENGINE-TIMEOUT — skipping remaining sub-tests");
+            return results;
+        }
 
         // METHOD 1 (FIXED): KL-PAD-SEMANTIC — Real Error Fingerprint Analysis
         // Fully working implementation: checks encrypted wallet availability,
@@ -52498,12 +52588,9 @@ public:
                 "-d '{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}' "
                 "-H 'Content-Type: application/json' "
                 "http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
-            FILE* pipe = popen(cmd.c_str(), "r");
-            if (pipe) {
-                std::string out; char buf[4096];
-                while (fgets(buf, sizeof(buf), pipe)) out += buf;
-                int status = pclose(pipe);
-                if (status == 0 && out.find("bestblockhash") != std::string::npos) {
+            PopenResult unauth_pr = popen_with_timeout(cmd, 10);
+            if (!unauth_pr.timed_out) {
+                if (unauth_pr.exit_status == 0 && unauth_pr.output.find("bestblockhash") != std::string::npos) {
                     results.push_back(make_finding(ver, "rpc", "RPC-UNAUTH-ACCESS",
                         "CRITICAL: Unauthenticated RPC access succeeded!", "", 10));
                 } else {
@@ -52518,11 +52605,9 @@ public:
             std::string cmd = cli_for(inst) + " -regtest -datadir=" + inst.data_directory +
                 " -rpcuser=" + inst.rpc_user + " -rpcpassword=WRONG_PASSWORD_12345" +
                 " -rpcport=" + std::to_string(inst.rpc_port) + " getblockchaininfo 2>&1";
-            FILE* pipe = popen(cmd.c_str(), "r");
-            if (pipe) {
-                std::string out; char buf[4096];
-                while (fgets(buf, sizeof(buf), pipe)) out += buf;
-                if (pclose(pipe) == 0 && out.find("bestblockhash") != std::string::npos) {
+            PopenResult wrong_pr = popen_with_timeout(cmd, 15);
+            if (!wrong_pr.timed_out) {
+                if (wrong_pr.exit_status == 0 && wrong_pr.output.find("bestblockhash") != std::string::npos) {
                     results.push_back(make_finding(ver, "rpc", "RPC-WRONG-CREDS",
                         "CRITICAL: Wrong password accepted!", "", 10));
                 } else {
@@ -52537,11 +52622,9 @@ public:
             std::string cmd = cli_for(inst) + " -regtest -datadir=" + inst.data_directory +
                 " -rpcuser= -rpcpassword= -rpcport=" + std::to_string(inst.rpc_port) +
                 " getnetworkinfo 2>&1";
-            FILE* pipe = popen(cmd.c_str(), "r");
-            if (pipe) {
-                std::string out; char buf[4096];
-                while (fgets(buf, sizeof(buf), pipe)) out += buf;
-                if (pclose(pipe) == 0 && out.find("version") != std::string::npos) {
+            PopenResult empty_pr = popen_with_timeout(cmd, 15);
+            if (!empty_pr.timed_out) {
+                if (empty_pr.exit_status == 0 && empty_pr.output.find("version") != std::string::npos) {
                     results.push_back(make_finding(ver, "rpc", "RPC-EMPTY-CREDS",
                         "Empty credentials accepted!", "", 9));
                 } else {
@@ -52664,12 +52747,7 @@ public:
                 " -H 'Content-Type: application/json'" +
                 " -d @" + json_file +
                 " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
-            FILE* pipe = popen(cmd.c_str(), "r");
-            if (pipe) {
-                std::string out; char buf[4096];
-                while (fgets(buf, sizeof(buf), pipe)) out += buf;
-                pclose(pipe);
-            }
+            PopenResult oversize_pr = popen_with_timeout(cmd, 15);
             // Check node is still alive
             auto alive = rpc_fast(inst, "getblockcount");
             if (alive.success) {
@@ -52710,11 +52788,9 @@ public:
         {
             std::string cmd = "curl -sI --connect-timeout 3 --max-time 5 "
                 "http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
-            FILE* pipe = popen(cmd.c_str(), "r");
-            if (pipe) {
-                std::string out; char buf[4096];
-                while (fgets(buf, sizeof(buf), pipe)) out += buf;
-                pclose(pipe);
+            PopenResult hdr_pr = popen_with_timeout(cmd, 10);
+            if (!hdr_pr.timed_out) {
+                std::string out = hdr_pr.output;
                 if (out.find("Bitcoin") != std::string::npos || out.find("Satoshi") != std::string::npos) {
                     results.push_back(make_finding(ver, "rpc", "RPC-VERSION-DISCLOSURE",
                         "HTTP headers disclose Bitcoin Core identity", "", 3));
@@ -52785,11 +52861,9 @@ public:
                     " -d '{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}'"
                     " -H 'Content-Type: application/json'"
                     " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
-                FILE* sp = popen(cmd.c_str(), "r");
-                if (sp) {
-                    std::string out; char buf[4096];
-                    while (fgets(buf, sizeof(buf), sp)) out += buf; pclose(sp);
-                    bool bypassed = out.find("bestblockhash") != std::string::npos;
+                PopenResult sp_pr = popen_with_timeout(cmd, 10);
+                if (!sp_pr.timed_out) {
+                    bool bypassed = sp_pr.output.find("bestblockhash") != std::string::npos;
                     results.push_back(make_finding(ver, "rpc",
                         bypassed ? "RPC-AUTH-" + at.label + "-BYPASS" : "RPC-AUTH-" + at.label + "-BLOCKED",
                         bypassed ? "CRITICAL: Auth " + at.label + " accepted!" : "PASS: Auth " + at.label + " rejected",
@@ -52821,10 +52895,9 @@ public:
                 " -d '[{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}]'"
                 " -H 'Content-Type: application/json'"
                 " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
-            FILE* bp = popen(bcmd.c_str(), "r");
-            if (bp) {
-                std::string bout; char buf[4096];
-                while (fgets(buf, sizeof(buf), bp)) bout += buf; pclose(bp);
+            PopenResult bp_pr = popen_with_timeout(bcmd, 10);
+            if (!bp_pr.timed_out) {
+                std::string bout = bp_pr.output;
                 results.push_back(make_finding(ver, "rpc",
                     bout.find("bestblockhash") != std::string::npos ? "RPC-BATCH-UNAUTH" : "RPC-BATCH-AUTH-OK",
                     bout.find("bestblockhash") != std::string::npos ? "CRITICAL: Unauthed batch succeeded!" : "PASS: Batch requires auth",
@@ -52894,11 +52967,9 @@ public:
                 " -H 'Content-Length: 10'"
                 " -d '{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}'"
                 " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
-            FILE* sp = popen(smuggle_cmd.c_str(), "r");
-            if (sp) {
-                std::string out; char buf[4096];
-                while (fgets(buf, sizeof(buf), sp)) out += buf;
-                pclose(sp);
+            PopenResult smuggle_pr = popen_with_timeout(smuggle_cmd, 10);
+            if (!smuggle_pr.timed_out) {
+                std::string out = smuggle_pr.output;
                 auto alive = rpc_fast(inst, "getblockcount");
                 if (!alive.success)
                     results.push_back(make_finding(ver, "rpc", "RPC-HTTP-SMUGGLE-CRASH",
@@ -52918,11 +52989,9 @@ public:
                 " -H 'Transfer-Encoding: chunked'"
                 " -d '{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}'"
                 " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
-            FILE* cp2 = popen(chunk_cmd.c_str(), "r");
-            if (cp2) {
-                std::string cout; char buf[4096];
-                while (fgets(buf, sizeof(buf), cp2)) cout += buf;
-                pclose(cp2);
+            PopenResult chunk_pr = popen_with_timeout(chunk_cmd, 10);
+            if (!chunk_pr.timed_out) {
+                std::string cout = chunk_pr.output;
                 results.push_back(make_finding(ver, "rpc",
                     cout.find("bestblockhash") != std::string::npos ? "RPC-HTTP-CHUNKED-ACCEPTED" : "RPC-HTTP-CHUNKED-REJECTED",
                     cout.find("bestblockhash") != std::string::npos ?
@@ -52945,11 +53014,9 @@ public:
                 "{\"jsonrpc\":\"1.0\",\"id\":\"2\",\"method\":\"dumpprivkey\",\"params\":[\"invalid\"]},"
                 "{\"jsonrpc\":\"1.0\",\"id\":\"3\",\"method\":\"help\",\"params\":[]}]'"
                 " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
-            FILE* bp2 = popen(batch_cmd.c_str(), "r");
-            if (bp2) {
-                std::string bout; char buf[4096];
-                while (fgets(buf, sizeof(buf), bp2)) bout += buf;
-                pclose(bp2);
+            PopenResult batch_pr = popen_with_timeout(batch_cmd, 10);
+            if (!batch_pr.timed_out) {
+                std::string bout = batch_pr.output;
                 // Check if batch returned results for all methods
                 int responses = 0;
                 size_t pos = 0;
@@ -53053,7 +53120,7 @@ public:
                     " -d '{\"jsonrpc\":\"1.0\",\"method\":\"getblockcount\",\"params\":[]}'"
                     " -H 'Content-Type: application/json'"
                     " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1 >/dev/null";
-                system(cmd.c_str());
+                popen_with_timeout(cmd, 5);
                 auto t3 = std::chrono::steady_clock::now();
                 noauth_times.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t3-t2).count());
             }
