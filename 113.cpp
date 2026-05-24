@@ -50025,15 +50025,41 @@ public:
                 return std::move(shared->findings);
             }
 
-            // Timed out — signal the thread to stop, then DETACH so this
-            // function returns immediately.  The detached thread will exit
-            // within ≤ POPEN_TIMEOUT_DEFAULT seconds once it checks the flag.
+            // Timed out — signal the thread to stop via cooperative cancellation,
+            // then wait a short grace period for it to join cleanly.
+            // DO NOT detach: detached threads continue issuing RPC calls and
+            // block bitcoind's queue, delaying subsequent sub-tests.
             kl_cancel_flag->store(true);
-            worker.detach();  // <-- does NOT block; thread runs to completion on its own
 
-            EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                ver + ": " + subtest_name + " exceeded " + std::to_string(timeout_secs) +
-                "s per-sub-test deadline — cancellation signalled, thread detached");
+            // Grace period: wait up to 5s for the thread to notice the flag
+            // and exit.  The thread checks kl_cancel_flag every 10-25 iterations
+            // and each RPC call has a short per-call timeout (8-10s via
+            // popen_with_timeout), so the thread should exit within one
+            // iteration boundary.
+            {
+                std::unique_lock<std::mutex> lk(shared->mtx);
+                bool joined_in_grace = shared->cv.wait_for(
+                    lk,
+                    std::chrono::seconds(5),
+                    [&]{ return shared->done; });
+                if (joined_in_grace) {
+                    worker.join();
+                    EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                        ver + ": " + subtest_name + " exceeded " + std::to_string(timeout_secs) +
+                        "s deadline but joined cleanly during grace period");
+                    // Return whatever partial results the thread produced
+                    if (!shared->findings.empty())
+                        return std::move(shared->findings);
+                } else {
+                    // Thread did not exit within grace period — detach as last resort
+                    // but log a warning so we can track this.
+                    worker.detach();
+                    EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                        ver + ": " + subtest_name + " exceeded " + std::to_string(timeout_secs) +
+                        "s deadline + 5s grace — thread detached (WARNING: may hold RPC queue)");
+                }
+            }
+
             return {make_finding(ver, "key_leakage", subtest_name + "-SUBTEST-TIMEOUT",
                 "Sub-test exceeded " + std::to_string(timeout_secs) + "s deadline (cancelled, not fatal)",
                 "timeout_s=" + std::to_string(timeout_secs), 0)};
@@ -50043,6 +50069,17 @@ public:
             results.push_back(make_finding(ver, "key_leakage", "KL-NO-WALLET",
                 "SKIP: Wallet not available", "", 0));
             return results;
+        }
+
+        // Track wallet encryption state for sub-tests (especially KL-PAD-SEMANTIC).
+        // have_wallet == true means ensure_wallet_encrypted() succeeded, so the
+        // wallet IS encrypted.  We verify once here and pass the flag forward.
+        bool wallet_encrypted = false;
+        {
+            auto wi_enc = rpc_fast(inst, "getwalletinfo");
+            if (wi_enc.success && wi_enc.has("unlocked_until")) {
+                wallet_encrypted = true;
+            }
         }
 
         // Enable full debug logging
@@ -50903,7 +50940,7 @@ public:
         //      Hard 30s timeout added. Progress logged every prefix step.
         // ================================================================
         {
-            const int KL_PREFIX_MAX_SECONDS = 30;
+            const int KL_PREFIX_MAX_SECONDS = 45;   // was 30 — increased to allow all 10 prefix lengths to complete
             const int KL_PREFIX_ITERATIONS  = 20;   // was 200 — 10x speedup
             const int KL_PREFIX_MAX_LEN     = 10;   // was 20 — 2x speedup
             auto kl_prefix_start = std::chrono::steady_clock::now();
@@ -51116,18 +51153,18 @@ public:
         // TYPE 1 ENHANCED: High-iteration timing oracle with t-test
         KL_CHECKPOINT("KL-PADDING-TIMING-DEEP");
         // NOVELTY DECLARATION — KL-PADDING-TIMING-DEEP
-        // Reduced to 500 iterations (statistically sufficient for Welch's t-test)
-        // with cooperative cancellation and internal deadline check every 50 iterations.
-        // Timeout reduced to 120s to prevent hang; cancellation flag checked each iteration.
+        // 500 iterations (statistically sufficient for Welch's t-test)
+        // with cooperative cancellation and internal deadline check every 25 iterations.
+        // Wrapper deadline 200s; internal deadline 180s to allow clean exit before wrapper fires.
         {
-            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 120, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 200, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 std::vector<double> valid_times, invalid_times;
                 std::string valid_shaped = "padding_valid_01";
                 std::string invalid_shaped = "padding_invalid0";
                 constexpr int TIMING_DEEP_ITERS = 500;
-                constexpr int DEADLINE_CHECK_INTERVAL = 50;
-                constexpr int INTERNAL_DEADLINE_SECS = 100; // break early before wrapper timeout
+                constexpr int DEADLINE_CHECK_INTERVAL = 25;
+                constexpr int INTERNAL_DEADLINE_SECS = 180; // generous: allows 500+ iters before wrapper's 200s deadline
                 auto loop_start = std::chrono::steady_clock::now();
                 bool cancelled_early = false;
                 int completed_iters = 0;
@@ -51510,17 +51547,18 @@ public:
         // Statistical validity: 50 samples/value gives robust skewness and
         // variance outlier detection for oracle effects >2× timing difference.
         // Outer step: bv += 16 (16 values) instead of bv += 8 (32 values).
+        // Deadline increased to 180s to allow full completion without detached threads.
         {
-            auto sub_results = run_subtest("KL-DEVIATION-FINGERPRINT", 120, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-DEVIATION-FINGERPRINT", 180, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 constexpr int DEV_FP_SAMPLES = 50;
                 std::map<int, std::vector<double>> dists;
                 for (int bv = 0; bv < 256; bv += 16) {
-                    if (kl_cancel_flag->load()) break;
+                    if (kl_cancel_flag->load()) return sub;
                     std::string probe = safe_passphrase(bv);
                     std::vector<double> samps;
                     for (int it = 0; it < DEV_FP_SAMPLES; it++) {
-                        if (kl_cancel_flag->load()) break;
+                        if (it % 10 == 0 && kl_cancel_flag->load()) return sub;
                         auto t0 = std::chrono::steady_clock::now();
                         rpc_fast(inst, "walletpassphrase", "[\"" + probe + "\", 1]");
                         auto t1 = std::chrono::steady_clock::now();
@@ -51574,8 +51612,9 @@ public:
         // FIX: 16×1000 = 16,000 calls (960s) → 16×50 = 800 calls (~48s).
         // Statistical validity: 50 samples/value, 20 histogram bins → ~2.5
         // samples/bin average; sufficient to detect entropy gradients > 1.5 bits.
+        // Deadline increased to 180s to allow full completion without detached threads.
         {
-            auto sub_results = run_subtest("KL-ENTROPY-GRADIENT", 120, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-ENTROPY-GRADIENT", 180, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 constexpr int ENT_GRAD_SAMPLES = 50;
                 auto shannon = [](const std::vector<double>& v, int bins) -> double {
@@ -51590,11 +51629,11 @@ public:
                 };
                 std::vector<double> ents;
                 for (int bv=0; bv<256; bv+=16) {
-                    if (kl_cancel_flag->load()) break;
+                    if (kl_cancel_flag->load()) return sub;
                     std::string pr = safe_passphrase(bv);
                     std::vector<double> sa;
                     for(int i=0;i<ENT_GRAD_SAMPLES;i++){
-                        if (kl_cancel_flag->load()) break;
+                        if (i % 10 == 0 && kl_cancel_flag->load()) return sub;
                         auto t0=std::chrono::steady_clock::now();
                         rpc_fast(inst,"walletpassphrase","[\""+pr+"\", 1]");
                         auto t1=std::chrono::steady_clock::now();
@@ -51829,7 +51868,7 @@ public:
         }
 
         // METHOD 1 (FIXED): KL-PAD-SEMANTIC — Real Error Fingerprint Analysis
-        // Fully working implementation: checks encrypted wallet availability,
+        // Fully working implementation: uses wallet_encrypted flag from engine start,
         // generates valid/invalid ciphertext variants via walletpassphrasechange,
         // captures and normalises error fingerprints, compares valid vs invalid sets.
         // Global timeout: 40 seconds. Per-call timeout: 5 seconds.
@@ -51837,37 +51876,32 @@ public:
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                 ver + ": KL-PAD-SEMANTIC — starting real error fingerprint analysis");
 
-            // Step 1: Check encrypted wallet availability and known passphrase
-            bool encrypted_wallet_available = false;
-            std::string known_passphrase = "audit_test_passphrase_2024";
-            if (have_wallet) {
-                // Check if wallet is encrypted by trying walletlock
-                auto lock_test = rpc_fast(inst, "walletlock", "");
-                auto wi_check = rpc_fast(inst, "getwalletinfo", "");
-                if (wi_check.success) {
-                    std::string unlocked_until = jx(wi_check.output, "unlocked_until");
-                    // If unlocked_until field exists, wallet is encrypted
-                    if (!unlocked_until.empty() || lock_test.output.find("not encrypted") == std::string::npos) {
-                        // Try to unlock with known passphrase to verify we have the right one
-                        auto unlock_test = rpc_fast(inst, "walletpassphrase",
-                            "[\"" + known_passphrase + "\", 10]");
-                        if (unlock_test.success && !unlock_test.is_error()) {
+            // Step 1: Use the wallet_encrypted flag set at engine start.
+            // The passphrase is the one used by ensure_wallet_encrypted() —
+            // config_.wallet_encryption_passphrase ("audit_test_passphrase_123").
+            // If wallet_encrypted is true but the wallet is currently locked,
+            // unlock it first with a quick walletpassphrase call.
+            bool encrypted_wallet_available = wallet_encrypted;
+            std::string known_passphrase = config_.wallet_encryption_passphrase;
+            if (wallet_encrypted) {
+                // Ensure wallet is unlocked for probing
+                auto unlock_check = rpc_fast(inst, "walletpassphrase",
+                    "[\"" + known_passphrase + "\", 30]");
+                if (!unlock_check.success || unlock_check.is_error()) {
+                    // Passphrase mismatch — try alternate passphrases
+                    encrypted_wallet_available = false;
+                    for (const auto& alt_pass : {"audit_test_passphrase_2024", "test", "password", "audit", ""}) {
+                        auto alt_test = rpc_fast(inst, "walletpassphrase",
+                            "[\"" + std::string(alt_pass) + "\", 30]");
+                        if (alt_test.success && !alt_test.is_error()) {
+                            known_passphrase = alt_pass;
                             encrypted_wallet_available = true;
-                            rpc_fast(inst, "walletlock", "");
-                        } else {
-                            // Try alternate passphrases used in test setup
-                            for (const auto& alt_pass : {"test", "password", "audit", ""}) {
-                                auto alt_test = rpc_fast(inst, "walletpassphrase",
-                                    "[\"" + std::string(alt_pass) + "\", 10]");
-                                if (alt_test.success && !alt_test.is_error()) {
-                                    known_passphrase = alt_pass;
-                                    encrypted_wallet_available = true;
-                                    rpc_fast(inst, "walletlock", "");
-                                    break;
-                                }
-                            }
+                            break;
                         }
                     }
+                }
+                if (encrypted_wallet_available) {
+                    rpc_fast(inst, "walletlock", "");
                 }
             }
 
@@ -51876,7 +51910,8 @@ public:
                 results.push_back(make_finding(ver, "key_leakage",
                     "KL-PAD-SEMANTIC-UNAVAIL",
                     "SKIP: Encrypted wallet not available or passphrase unknown for semantic analysis",
-                    "have_wallet=" + std::string(have_wallet ? "true" : "false"), 0));
+                    "have_wallet=" + std::string(have_wallet ? "true" : "false") +
+                    " wallet_encrypted=" + std::string(wallet_encrypted ? "true" : "false"), 0));
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-PAD-SEMANTIC-UNAVAIL — no encrypted wallet for fingerprint analysis");
             } else {
