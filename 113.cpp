@@ -46750,6 +46750,7 @@ public:
 
 private:
     bool verbose_;
+    std::string wallet_encryption_passphrase_ = "audit_test_passphrase_123";
 
     struct RpcResult {
         std::string output;
@@ -47320,7 +47321,8 @@ private:
     }
 
 public:
-    explicit DeepVerificationEngine(bool verbose = true) : verbose_(verbose) {}
+    explicit DeepVerificationEngine(bool verbose = true, const std::string& wallet_passphrase = "audit_test_passphrase_123")
+        : verbose_(verbose), wallet_encryption_passphrase_(wallet_passphrase) {}
 
     // Public accessors for orchestrator to call before bridge tests
     bool ensure_wallet(VersionInstance* inst) { return ensure_wallet_universal(*inst); }
@@ -51882,7 +51884,7 @@ public:
             // If wallet_encrypted is true but the wallet is currently locked,
             // unlock it first with a quick walletpassphrase call.
             bool encrypted_wallet_available = wallet_encrypted;
-            std::string known_passphrase = config_.wallet_encryption_passphrase;
+            std::string known_passphrase = wallet_encryption_passphrase_;
             if (wallet_encrypted) {
                 // Ensure wallet is unlocked for probing
                 auto unlock_check = rpc_fast(inst, "walletpassphrase",
@@ -57326,7 +57328,7 @@ public:
         EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
             "unified", "=== Phase 3/4: Deep Dynamic Verification ===");
 
-        DeepVerificationEngine engine(config_.verbose);
+        DeepVerificationEngine engine(config_.verbose, config_.wallet_encryption_passphrase);
 
         for (const auto& version : versions) {
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
@@ -59529,7 +59531,7 @@ public:
             "Versions: " + std::to_string(versions.size()));
 
         EvidenceCollector evidence(config_.evidence_dir);
-        DeepVerificationEngine deep_engine(config_.verbose);
+        DeepVerificationEngine deep_engine(config_.verbose, config_.wallet_encryption_passphrase);
         NovelBugDiscoveryEngineV2 fuzz_engine;
         CoverageGuidedFuzzer coverage_fuzzer;
 
