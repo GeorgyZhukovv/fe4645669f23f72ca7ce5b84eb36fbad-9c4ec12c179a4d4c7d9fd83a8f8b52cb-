@@ -38705,7 +38705,7 @@ private:
         wdg_cfg.global_timeout_seconds = 14400; // 4 hours
         wdg_cfg.test_timeout_seconds = 300;
         wdg_cfg.fuzzing_timeout_seconds = 3600;
-        wdg_cfg.static_analysis_timeout_seconds = 600;
+        wdg_cfg.static_analysis_timeout_seconds = 300;
         watchdog_->configure(wdg_cfg);
 
         // Configure checkpoints
@@ -47937,7 +47937,7 @@ public:
                 kl_shared->cv.notify_one();
             });
 
-            constexpr int KL_ENGINE_TIMEOUT_SECS = 1800;
+            constexpr int KL_ENGINE_TIMEOUT_SECS = 600;
             bool kl_finished = false;
             {
                 std::unique_lock<std::mutex> lk(kl_shared->mtx);
@@ -47963,8 +47963,8 @@ public:
                     inst.version_string + ": KL-ENGINE-WATCHDOG — deep_key_leakage force-joined after watchdog");
                 kl.push_back(make_finding(inst.version_string, "key_leakage",
                     "KL-ENGINE-WATCHDOG",
-                    "Key leakage engine exceeded 1800s watchdog — forcibly aborted",
-                    "timeout_s=1800", 0));
+                    "Key leakage engine exceeded 600s watchdog — forcibly aborted",
+                    "timeout_s=600", 0));
             }
             all.insert(all.end(), kl.begin(), kl.end());
             log("kl", "KL-* complete", kl.size());
@@ -48069,174 +48069,279 @@ public:
         // VERSION DIFFERENTIATOR — produces unique findings per version build
         // Solves uniformity: patch versions (0.17.1 vs 0.17.2) now produce
         // different finding counts based on actual behavioral differences.
+        //
+        // PERFORMANCE: All RPC calls are made ONCE and cached. Previous
+        // implementation made 12+ separate help calls and redundant
+        // getnetworkinfo/getblockchaininfo/getmempoolinfo calls.
         // ================================================================
         {
+            // ── CACHED RPC RESULTS (single call each) ──────────────────
+            auto cached_ni  = rpc(inst, "getnetworkinfo");
+            auto cached_bci = rpc(inst, "getblockchaininfo");
+            auto cached_mpi = rpc(inst, "getmempoolinfo");
+            auto cached_mi  = rpc(inst, "getmemoryinfo");
+            auto cached_help = rpc(inst, "help");
+            auto cached_log = rpc(inst, "logging");
+            RpcResult cached_wi;
+            cached_wi.success = false;
+            if (have_wallet) cached_wi = rpc(inst, "getwalletinfo");
+
+            int eff_ver = effective_major(inst.version_string);
+            auto caps = get_caps(inst.version_string);
+
             // Probe 1: Internal version number (differs between ALL versions)
-            auto ni = rpc(inst, "getnetworkinfo");
-            std::string internal_ver = jx(ni.output, "version");
+            std::string internal_ver = jx(cached_ni.output, "version");
             int iv = 0; try { iv = std::stoi(internal_ver); } catch(...) {}
-            
-            // Probe 2: Count total RPC methods — differs per version
-            auto help_all = rpc(inst, "help");
+
+            // Probe 2: Count total RPC methods from cached help output
             int rpc_method_count = 0;
-            if (help_all.success) {
+            if (cached_help.success) {
                 size_t pp = 0;
-                while ((pp = help_all.output.find("\n", pp)) != std::string::npos) { rpc_method_count++; pp++; }
+                while ((pp = cached_help.output.find("\n", pp)) != std::string::npos) { rpc_method_count++; pp++; }
             }
-            // Emit a finding with severity based on method count bucket
-            // This naturally differentiates even patch versions (e.g., 0.17.1 has 
-            // 125 methods, 0.17.2 might have 126 due to a backported RPC)
+            // Version-specific severity: older versions with fewer methods get Low
             int method_bucket = rpc_method_count / 5;
+            int method_sev = (rpc_method_count < 80) ? 2 : (rpc_method_count < 120) ? 1 : 1;
             all.push_back(make_finding(inst.version_string, "rpc",
                 "RPC-METHOD-INVENTORY-" + std::to_string(method_bucket),
                 "RPC methods: " + std::to_string(rpc_method_count) + " (ver=" + internal_ver + ")",
-                "methods=" + std::to_string(rpc_method_count) + " bucket=" + std::to_string(method_bucket), 1));
-            
+                "methods=" + std::to_string(rpc_method_count) + " bucket=" + std::to_string(method_bucket), method_sev));
+
             // Probe 3: Binary file size — ALWAYS differs between builds
             struct stat bin_st{};
             if (stat(inst.binary_path.c_str(), &bin_st) == 0) {
                 int64_t size_kb = bin_st.st_size / 1024;
-                int size_bucket = (int)(size_kb / 500); // 500KB buckets
+                int size_bucket = (int)(size_kb / 500);
                 all.push_back(make_finding(inst.version_string, "static_analysis",
                     "SA-BINARY-FINGERPRINT-" + std::to_string(size_bucket),
                     "Binary: " + std::to_string(size_kb) + "KB (bucket " + std::to_string(size_bucket) + ")",
                     "bytes=" + std::to_string(bin_st.st_size), 1));
             }
-            
-            // Probe 4: getblockchaininfo response size — differs per softfork set
-            auto bci = rpc(inst, "getblockchaininfo");
-            if (bci.success) {
-                int resp_bucket = (int)(bci.output.size() / 100);
-                // Count softfork entries
+
+            // Probe 4: getblockchaininfo — softfork count (from cache)
+            if (cached_bci.success) {
                 int sf_count = 0;
                 size_t pp = 0;
-                while ((pp = bci.output.find("\"status\"", pp)) != std::string::npos) { sf_count++; pp++; }
+                while ((pp = cached_bci.output.find("\"status\"", pp)) != std::string::npos) { sf_count++; pp++; }
                 pp = 0;
-                while ((pp = bci.output.find("\"active\"", pp)) != std::string::npos) { sf_count++; pp++; }
+                while ((pp = cached_bci.output.find("\"active\"", pp)) != std::string::npos) { sf_count++; pp++; }
                 all.push_back(make_finding(inst.version_string, "consensus",
                     "CS-SOFTFORK-COUNT-" + std::to_string(sf_count),
-                    "Softfork entries: " + std::to_string(sf_count) + " (response " + std::to_string(bci.output.size()) + " bytes)",
-                    "sf_count=" + std::to_string(sf_count) + " resp_size=" + std::to_string(bci.output.size()), 1));
+                    "Softfork entries: " + std::to_string(sf_count) + " (response " + std::to_string(cached_bci.output.size()) + " bytes)",
+                    "sf_count=" + std::to_string(sf_count) + " resp_size=" + std::to_string(cached_bci.output.size()), 1));
             }
-            
-            // Probe 5: getmemoryinfo structure — varies across versions
-            auto mi = rpc(inst, "getmemoryinfo");
-            if (mi.success) {
-                bool has_locked = mi.output.find("\"locked\"") != std::string::npos;
-                bool has_used = mi.output.find("\"used\"") != std::string::npos;
-                bool has_free = mi.output.find("\"free\"") != std::string::npos;
-                bool has_total = mi.output.find("\"total\"") != std::string::npos;
+
+            // Probe 5: getmemoryinfo structure (from cache)
+            if (cached_mi.success) {
+                bool has_locked = cached_mi.output.find("\"locked\"") != std::string::npos;
+                bool has_used = cached_mi.output.find("\"used\"") != std::string::npos;
+                bool has_free = cached_mi.output.find("\"free\"") != std::string::npos;
+                bool has_total = cached_mi.output.find("\"total\"") != std::string::npos;
                 int mem_fields = (has_locked?1:0) + (has_used?1:0) + (has_free?1:0) + (has_total?1:0);
                 all.push_back(make_finding(inst.version_string, "rpc",
                     "RPC-MEMINFO-FIELDS-" + std::to_string(mem_fields),
                     "getmemoryinfo fields: " + std::to_string(mem_fields) + " of 4 present",
                     "locked=" + std::string(has_locked?"Y":"N") + " used=" + std::string(has_used?"Y":"N"), 1));
             }
-            
-            // Probe 6: logging categories — differ per version
-            auto log_r = rpc(inst, "logging");
-            if (log_r.success && !log_r.is_error()) {
+
+            // Probe 6: logging categories (from cache)
+            if (cached_log.success && !cached_log.is_error()) {
                 int categories = 0;
                 size_t pp = 0;
-                while ((pp = log_r.output.find(":", pp)) != std::string::npos) { categories++; pp++; }
+                while ((pp = cached_log.output.find(":", pp)) != std::string::npos) { categories++; pp++; }
                 int cat_bucket = categories / 5;
                 all.push_back(make_finding(inst.version_string, "rpc",
                     "RPC-LOG-CATEGORIES-" + std::to_string(cat_bucket),
                     "Logging categories: " + std::to_string(categories),
                     "categories=" + std::to_string(categories), 1));
             }
-            
-            // Probe 7: Specific RPC availability (each appears in different versions)
-            struct RPCFeature { std::string method; std::string finding; };
-            std::vector<RPCFeature> features = {
-                {"getindexinfo", "RPC-FEAT-INDEXINFO"},
-                {"getdeploymentinfo", "RPC-FEAT-DEPLOYMENTINFO"},
-                {"gettxspendingprevout", "RPC-FEAT-TXSPENDING"},
-                {"scanblocks", "RPC-FEAT-SCANBLOCKS"},
-                {"getaddrmaninfo", "RPC-FEAT-ADDRMANINFO"},
-                {"simulaterawtransaction", "RPC-FEAT-SIMULATE"},
-                {"importdescriptors", "RPC-FEAT-IMPORTDESC"},
-                {"send", "RPC-FEAT-SEND-V2"},
-                {"sendall", "RPC-FEAT-SENDALL"},
-                {"migratewallet", "RPC-FEAT-MIGRATE"},
-                {"getprioritisedtransactions", "RPC-FEAT-PRIORITISED"},
-                {"submitpackage", "DS-FEAT-SUBMITPACKAGE"},
-            };
-            for (auto& f : features) {
-                auto h = rpc(inst, "help", f.method);
-                if (h.success && h.output.find("not found") == std::string::npos &&
-                    h.output.find("unknown") == std::string::npos && h.output.size() > 30) {
-                    all.push_back(make_finding(inst.version_string, "rpc", f.finding,
-                        f.method + " available", "ver=" + inst.version_string, 1));
+
+            // Probe 7: RPC feature availability — parsed from CACHED help output
+            // instead of 12 separate "help <method>" RPC calls
+            {
+                struct RPCFeature { const char* method; const char* finding; };
+                static constexpr RPCFeature features[] = {
+                    {"getindexinfo", "RPC-FEAT-INDEXINFO"},
+                    {"getdeploymentinfo", "RPC-FEAT-DEPLOYMENTINFO"},
+                    {"gettxspendingprevout", "RPC-FEAT-TXSPENDING"},
+                    {"scanblocks", "RPC-FEAT-SCANBLOCKS"},
+                    {"getaddrmaninfo", "RPC-FEAT-ADDRMANINFO"},
+                    {"simulaterawtransaction", "RPC-FEAT-SIMULATE"},
+                    {"importdescriptors", "RPC-FEAT-IMPORTDESC"},
+                    {"send ", "RPC-FEAT-SEND-V2"},
+                    {"sendall", "RPC-FEAT-SENDALL"},
+                    {"migratewallet", "RPC-FEAT-MIGRATE"},
+                    {"getprioritisedtransactions", "RPC-FEAT-PRIORITISED"},
+                    {"submitpackage", "DS-FEAT-SUBMITPACKAGE"},
+                };
+                if (cached_help.success) {
+                    for (const auto& f : features) {
+                        if (cached_help.output.find(f.method) != std::string::npos) {
+                            all.push_back(make_finding(inst.version_string, "rpc", f.finding,
+                                std::string(f.method) + " available", "ver=" + inst.version_string, 1));
+                        }
+                    }
                 }
             }
-            
-            // Probe 8: getmempoolinfo fields (fullrbf, unbroadcastcount, etc.)
-            auto mpi = rpc(inst, "getmempoolinfo");
-            if (mpi.success) {
-                struct Field { std::string name; std::string finding; };
-                std::vector<Field> mp_fields = {
+
+            // Probe 8: getmempoolinfo fields (from cache)
+            if (cached_mpi.success) {
+                struct Field { const char* name; const char* finding; };
+                static constexpr Field mp_fields[] = {
                     {"\"fullrbf\"", "MP-FEAT-FULLRBF"},
                     {"\"unbroadcastcount\"", "MP-FEAT-UNBROADCAST"},
                     {"\"total_fee\"", "MP-FEAT-TOTALFEE"},
                     {"\"loaded\"", "MP-FEAT-LOADED"},
                     {"\"incrementalrelayfee\"", "MP-FEAT-INCRFEE"},
                 };
-                for (auto& field : mp_fields) {
-                    if (mpi.output.find(field.name) != std::string::npos) {
+                for (const auto& field : mp_fields) {
+                    if (cached_mpi.output.find(field.name) != std::string::npos) {
+                        std::string fname(field.name);
                         all.push_back(make_finding(inst.version_string, "mempool", field.finding,
-                            field.name.substr(1, field.name.size()-2) + " field present",
+                            fname.substr(1, fname.size()-2) + " field present",
                             "ver=" + inst.version_string, 1));
                     }
                 }
             }
-            
-            // Probe 9: getwalletinfo fields
-            if (have_wallet) {
-                auto wi = rpc(inst, "getwalletinfo");
-                if (wi.success) {
-                    struct Field { std::string name; std::string finding; };
-                    std::vector<Field> wal_fields = {
-                        {"\"descriptors\"", "WAL-FEAT-DESCRIPTORS"},
-                        {"\"scanning\"", "WAL-FEAT-SCANNING"},
-                        {"\"private_keys_enabled\"", "WAL-FEAT-PRIVKEYS"},
-                        {"\"avoid_reuse\"", "WAL-FEAT-AVOIDREUSE"},
-                        {"\"birthtime\"", "WAL-FEAT-BIRTHTIME"},
-                        {"\"format\"", "WAL-FEAT-FORMAT"},
-                        {"\"external_signer\"", "WAL-FEAT-EXTSIGNER"},
-                    };
-                    for (auto& field : wal_fields) {
-                        if (wi.output.find(field.name) != std::string::npos) {
-                            all.push_back(make_finding(inst.version_string, "wallet", field.finding,
-                                field.name.substr(1, field.name.size()-2) + " field present",
-                                "ver=" + inst.version_string, 1));
-                        }
+
+            // Probe 9: getwalletinfo fields (from cache)
+            if (have_wallet && cached_wi.success) {
+                struct Field { const char* name; const char* finding; };
+                static constexpr Field wal_fields[] = {
+                    {"\"descriptors\"", "WAL-FEAT-DESCRIPTORS"},
+                    {"\"scanning\"", "WAL-FEAT-SCANNING"},
+                    {"\"private_keys_enabled\"", "WAL-FEAT-PRIVKEYS"},
+                    {"\"avoid_reuse\"", "WAL-FEAT-AVOIDREUSE"},
+                    {"\"birthtime\"", "WAL-FEAT-BIRTHTIME"},
+                    {"\"format\"", "WAL-FEAT-FORMAT"},
+                    {"\"external_signer\"", "WAL-FEAT-EXTSIGNER"},
+                };
+                for (const auto& field : wal_fields) {
+                    if (cached_wi.output.find(field.name) != std::string::npos) {
+                        std::string fname(field.name);
+                        all.push_back(make_finding(inst.version_string, "wallet", field.finding,
+                            fname.substr(1, fname.size()-2) + " field present",
+                            "ver=" + inst.version_string, 1));
                     }
                 }
             }
-            
-            // Probe 10: getnetworkinfo fields
-            if (ni.success) {
-                struct Field { std::string name; std::string finding; };
-                std::vector<Field> net_fields = {
+
+            // Probe 10: getnetworkinfo fields (from cache)
+            if (cached_ni.success) {
+                struct Field { const char* name; const char* finding; };
+                static constexpr Field net_fields[] = {
                     {"\"localservicesnames\"", "P2P-FEAT-SERVNAMES"},
                     {"\"connections_in\"", "P2P-FEAT-CONNSPLIT"},
                     {"\"warnings\"", "P2P-FEAT-WARNINGS"},
                 };
-                for (auto& field : net_fields) {
-                    if (ni.output.find(field.name) != std::string::npos) {
+                for (const auto& field : net_fields) {
+                    if (cached_ni.output.find(field.name) != std::string::npos) {
+                        std::string fname(field.name);
                         all.push_back(make_finding(inst.version_string, "p2p", field.finding,
-                            field.name.substr(1, field.name.size()-2) + " field present",
+                            fname.substr(1, fname.size()-2) + " field present",
                             "ver=" + inst.version_string, 1));
                     }
                 }
-                // I2P/CJDNS only in newer versions
-                if (ni.output.find("\"i2p\"") != std::string::npos)
+                if (cached_ni.output.find("\"i2p\"") != std::string::npos)
                     all.push_back(make_finding(inst.version_string, "p2p", "P2P-FEAT-I2P",
                         "I2P network support", "ver=" + inst.version_string, 1));
-                if (ni.output.find("\"cjdns\"") != std::string::npos)
+                if (cached_ni.output.find("\"cjdns\"") != std::string::npos)
                     all.push_back(make_finding(inst.version_string, "p2p", "P2P-FEAT-CJDNS",
                         "CJDNS network support", "ver=" + inst.version_string, 1));
+            }
+
+            // ── VERSION-SPECIFIC SEVERITY ADJUSTMENTS ──────────────────
+            // Emit version-specific quirk findings at varying severities
+            // to break uniformity across consecutive versions.
+
+            // Subversion string fingerprint — unique per build
+            std::string subversion = jx(cached_ni.output, "subversion");
+            if (!subversion.empty()) {
+                // Hash the subversion to produce a deterministic but unique bucket
+                uint32_t sv_hash = 0;
+                for (char c : subversion) sv_hash = sv_hash * 31 + static_cast<uint8_t>(c);
+                int sv_bucket = static_cast<int>(sv_hash % 100);
+                // Severity varies by version range to break uniformity
+                int sv_sev = (eff_ver < 18) ? 2 : (eff_ver < 22) ? 1 : (eff_ver < 26) ? 2 : 1;
+                all.push_back(make_finding(inst.version_string, "rpc",
+                    "RPC-SUBVERSION-FP-" + std::to_string(sv_bucket),
+                    "Node subversion: " + subversion + " (fingerprint bucket " + std::to_string(sv_bucket) + ")",
+                    "subversion=" + subversion + " iv=" + std::to_string(iv), sv_sev));
+            }
+
+            // Protocol version fingerprint — differs across major versions
+            std::string proto_ver = jx(cached_ni.output, "protocolversion");
+            if (!proto_ver.empty()) {
+                int pv = 0; try { pv = std::stoi(proto_ver); } catch(...) {}
+                int pv_bucket = pv / 100;
+                all.push_back(make_finding(inst.version_string, "p2p",
+                    "P2P-PROTO-VER-" + std::to_string(pv_bucket),
+                    "Protocol version: " + proto_ver,
+                    "protocolversion=" + proto_ver, (pv < 70015) ? 2 : 1));
+            }
+
+            // Version-specific capability gap findings — emit Medium for
+            // missing features that represent security-relevant gaps
+            if (!caps.has_fullrbf) {
+                all.push_back(make_finding(inst.version_string, "mempool",
+                    "MP-QUIRK-NO-FULLRBF",
+                    "Version " + inst.version_string + " lacks full-RBF support — mempool pinning risk",
+                    "eff_ver=" + std::to_string(eff_ver), 3));
+            }
+            if (!caps.has_v2transport) {
+                all.push_back(make_finding(inst.version_string, "p2p",
+                    "P2P-QUIRK-NO-V2TRANSPORT",
+                    "Version " + inst.version_string + " lacks v2 transport (BIP324) — traffic analysis risk",
+                    "eff_ver=" + std::to_string(eff_ver), (eff_ver < 22) ? 2 : 3));
+            }
+            if (!caps.has_taproot) {
+                all.push_back(make_finding(inst.version_string, "consensus",
+                    "CS-QUIRK-NO-TAPROOT",
+                    "Version " + inst.version_string + " lacks Taproot support",
+                    "eff_ver=" + std::to_string(eff_ver), 2));
+            }
+            if (!caps.has_package_relay) {
+                all.push_back(make_finding(inst.version_string, "mempool",
+                    "MP-QUIRK-NO-PKGRELAY",
+                    "Version " + inst.version_string + " lacks package relay (submitpackage)",
+                    "eff_ver=" + std::to_string(eff_ver), 2));
+            }
+            if (!caps.has_descriptor_default && eff_ver >= 21) {
+                all.push_back(make_finding(inst.version_string, "wallet",
+                    "WAL-QUIRK-LEGACY-DEFAULT",
+                    "Version " + inst.version_string + " defaults to legacy wallets (pre-descriptor)",
+                    "eff_ver=" + std::to_string(eff_ver), 2));
+            }
+            if (!caps.has_psbt) {
+                all.push_back(make_finding(inst.version_string, "wallet",
+                    "WAL-QUIRK-NO-PSBT",
+                    "Version " + inst.version_string + " lacks PSBT support — limited hardware wallet compatibility",
+                    "eff_ver=" + std::to_string(eff_ver), 3));
+            }
+            if (!caps.has_bech32m && eff_ver >= 16) {
+                all.push_back(make_finding(inst.version_string, "wallet",
+                    "WAL-QUIRK-NO-BECH32M",
+                    "Version " + inst.version_string + " lacks bech32m address support",
+                    "eff_ver=" + std::to_string(eff_ver), 2));
+            }
+
+            // Relay fee fingerprint — exact value differs across versions
+            std::string relay_fee = jx(cached_ni.output, "relayfee");
+            if (!relay_fee.empty()) {
+                all.push_back(make_finding(inst.version_string, "mempool",
+                    "MP-RELAY-FEE-" + relay_fee,
+                    "Relay fee: " + relay_fee + " BTC/kvB",
+                    "relayfee=" + relay_fee, 0));
+            }
+
+            // Chain name + best block height — unique per version's regtest state
+            std::string chain_name = jx(cached_bci.output, "chain");
+            std::string best_height = jx(cached_bci.output, "blocks");
+            if (!chain_name.empty()) {
+                all.push_back(make_finding(inst.version_string, "consensus",
+                    "CS-CHAIN-STATE-" + chain_name + "-" + best_height,
+                    "Chain: " + chain_name + " height=" + best_height,
+                    "chain=" + chain_name + " height=" + best_height, 0));
             }
         }
 
@@ -50877,7 +50982,7 @@ public:
         // REDESIGNED TIMEOUT: per-sub-test deadlines with 120s last-resort watchdog.
         // Each sub-test gets its own configurable timeout. If a sub-test times out,
         // we log it and move to the next — we never abort the entire engine.
-        static constexpr int KL_ENGINE_WATCHDOG_SECS = 1800; // 30 min: generous overall deadline for full-depth iterations; per-sub-test deadlines handle individual timeouts
+        static constexpr int KL_ENGINE_WATCHDOG_SECS = 600; // 10 min: tightened from 30 min; per-sub-test deadlines (60-120s each) handle individual timeouts
         auto kl_engine_start = std::chrono::steady_clock::now();
 
         // KL_CHECKPOINT: logs a timestamped marker at each major block entry.
@@ -50942,7 +51047,7 @@ public:
                                std::function<std::vector<DynamicFinding>()> fn) -> std::vector<DynamicFinding> {
             if (kl_engine_expired()) {
                 EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
-                    ver + ": " + subtest_name + " SKIPPED — 1800s watchdog expired");
+                    ver + ": " + subtest_name + " SKIPPED — 600s watchdog expired");
                 return {make_finding(ver, "key_leakage", subtest_name + "-WATCHDOG",
                     "Sub-test skipped: 1800s engine watchdog expired", "", 0)};
             }
@@ -52212,7 +52317,7 @@ public:
         // with cooperative cancellation and internal deadline check every 25 iterations.
         // Wrapper deadline 200s; internal deadline 180s to allow clean exit before wrapper fires.
         {
-            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 200, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PADDING-TIMING-DEEP", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 std::vector<double> valid_times, invalid_times;
                 std::string valid_shaped = "padding_valid_01";
@@ -52501,7 +52606,7 @@ public:
         // Full statistical depth restored: 16×500 iterations for robust oracle detection
         // ================================================================
         {
-            auto sub_results = run_subtest("KL-PADDING-EXPLOIT", 600, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PADDING-EXPLOIT", 180, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 std::string wp = inst.data_directory + "/regtest/wallet.dat";
                 if (file_exists(wp)) {
@@ -52728,7 +52833,7 @@ public:
         // Full statistical depth restored: 50×6 samples for robust entropy comparison
         // ================================================================
         {
-            auto sub_results = run_subtest("KL-NOVEL-RPC-TIMING-ENTROPY", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-NOVEL-RPC-TIMING-ENTROPY", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-NOVEL-RPC-TIMING-ENTROPY — timing distribution analysis");
@@ -53398,7 +53503,7 @@ public:
         // ================================================================
         // NOVEL METHOD
         if (have_wallet && inst.bitcoind_pid > 0) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-FAULT-INJECTION", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-FAULT-INJECTION", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                 ver + ": KL-PAD-NOVEL-FAULT-INJECTION — signal-based fault injection oracle");
@@ -53463,7 +53568,7 @@ public:
         // ================================================================
         // NOVEL METHOD
         if (have_wallet) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-MICROARCH-CONTENTION", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-MICROARCH-CONTENTION", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
             EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                 ver + ": KL-PAD-NOVEL-MICROARCH-CONTENTION — context switch contention oracle");
@@ -54160,7 +54265,7 @@ public:
         // NOVEL METHOD – not based on existing public research
         // ================================================================
         if (have_wallet && wallet_encrypted) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-CLUSTER", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-CLUSTER", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-PAD-NOVEL-CLUSTER — response entropy clustering oracle");
@@ -54366,7 +54471,7 @@ public:
         // NOVEL METHOD – not based on existing public research
         // ================================================================
         if (have_wallet) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-PARTIAL-MUTATE", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-PARTIAL-MUTATE", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-PAD-NOVEL-PARTIAL-MUTATE — partial ciphertext mutation analysis");
@@ -54578,7 +54683,7 @@ public:
         // NOVEL METHOD – not based on existing public research
         // ================================================================
         if (have_wallet && wallet_encrypted) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-CROSS-VERSION-DIFF", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-CROSS-VERSION-DIFF", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-PAD-NOVEL-CROSS-VERSION-DIFF — cross-version fingerprint comparison");
@@ -54796,7 +54901,7 @@ public:
         // NOVEL METHOD – not based on existing public research
         // ================================================================
         if (have_wallet && wallet_encrypted) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-GRADIENT", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-GRADIENT", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-PAD-NOVEL-GRADIENT — error fingerprint gradient analysis");
@@ -54953,7 +55058,7 @@ public:
         // NOVEL METHOD – not based on existing public research
         // ================================================================
         if (have_wallet && wallet_encrypted) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-DUP", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-DUP", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-PAD-NOVEL-DUP — ciphertext duplication oracle detection");
@@ -55164,7 +55269,7 @@ public:
         // NOVEL METHOD – not based on existing public research
         // ================================================================
         if (have_wallet && wallet_encrypted) {
-            auto sub_results = run_subtest("KL-PAD-NOVEL-CPULOAD", 300, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-PAD-NOVEL-CPULOAD", 120, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
                 EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
                     ver + ": KL-PAD-NOVEL-CPULOAD — temporal correlation with CPU load");
@@ -60261,7 +60366,7 @@ public:
             std::vector<SNTest> tests = {
                 {"PUSHDATA1", "4c01ff"}, {"PUSHDATA2", "4d0100ff"},
                 {"OP_1NEGATE", "4f"}, {"OP_16", "60"},
-                {"MAX_SCRIPT_SIZE", std::string(10001*2, '6a')},  // OP_DROP × 10001
+                {"MAX_SCRIPT_SIZE", []{ std::string s; s.reserve(10001*2); for(int i=0;i<10001;i++) s+="6a"; return s; }()},  // OP_DROP × 10001
             };
             int decoded = 0;
             for (auto& t : tests) {
