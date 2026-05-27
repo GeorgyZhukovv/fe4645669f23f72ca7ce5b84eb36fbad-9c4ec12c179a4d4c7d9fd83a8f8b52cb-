@@ -54042,7 +54042,8 @@ public:
                             "POST / HTTP/1.1\r\n"
                             "Host: 127.0.0.1\r\n"
                             "Content-Type: application/json\r\n"
-                            "Content-Length: " + std::to_string(rpc_body.size()) + "\r\n\r\n" + rpc_body;
+                            "Content-Length: " + std::to_string(rpc_body.size()) + "\r\n"
+                            "Connection: close\r\n\r\n" + rpc_body;
                         send(fd, post_req.c_str(), post_req.size(), 0);
                         memset(buf, 0, sizeof(buf));
                         n = recv(fd, buf, sizeof(buf) - 1, 0);
@@ -54075,7 +54076,8 @@ public:
                         std::string req =
                             "POST / HTTP/1.0\r\n"
                             "Content-Type: application/json\r\n"
-                            "Content-Length: " + std::to_string(rpc_body.size()) + "\r\n\r\n" + rpc_body;
+                            "Content-Length: " + std::to_string(rpc_body.size()) + "\r\n"
+                            "Connection: close\r\n\r\n" + rpc_body;
                         send(fd, req.c_str(), req.size(), 0);
                         char buf[4096] = {};
                         ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
@@ -54153,7 +54155,8 @@ public:
                             "Host: 127.0.0.1\r\n"
                             "Authorization: Basic " + encoded + "\r\n"
                             "Content-Type: application/json\r\n"
-                            "Content-Length: " + std::to_string(notif_body.size()) + "\r\n\r\n" + notif_body;
+                            "Content-Length: " + std::to_string(notif_body.size()) + "\r\n"
+                            "Connection: close\r\n\r\n" + notif_body;
                         send(fd, req.c_str(), req.size(), 0);
                         char buf[4096] = {};
                         recv(fd, buf, sizeof(buf) - 1, 0); // consume response (if any)
@@ -54228,7 +54231,8 @@ public:
                     if (!ct.empty()) {
                         req += "Content-Type: " + ct + "\r\n";
                     }
-                    req += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+                    req += "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                           "Connection: close\r\n\r\n" + body;
                     send(fd, req.c_str(), req.size(), 0);
                     char buf[4096] = {};
                     ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
@@ -56595,7 +56599,8 @@ public:
                                 std::string req = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                                     "Authorization: Basic " + encoded + "\r\n"
                                     "Content-Type: application/json\r\n"
-                                    "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+                                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                                    "Connection: close\r\n\r\n" + body;
                                 send(fd, req.c_str(), req.size(), 0);
                                 char buf[4096] = {};
                                 ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
@@ -56661,7 +56666,8 @@ public:
                             std::string req2 = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                                 "Authorization: Basic " + enc2 + "\r\n"
                                 "Content-Type: application/json\r\n"
-                                "Content-Length: " + std::to_string(body2.size()) + "\r\n\r\n" + body2;
+                                "Content-Length: " + std::to_string(body2.size()) + "\r\n"
+                                "Connection: close\r\n\r\n" + body2;
                             send(fd2, req2.c_str(), req2.size(), 0);
                             char buf2[4096] = {};
                             ssize_t n2 = recv(fd2, buf2, sizeof(buf2) - 1, 0);
@@ -58525,6 +58531,7 @@ public:
                     ht.extra_header +
                     "Content-Type: application/json\r\n"
                     "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                    "Connection: close\r\n"
                     "\r\n" + body;
                 int fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (fd < 0) continue;
@@ -59210,6 +59217,59 @@ public:
         }
 
         } // end RPC novel auth scope
+
+        // POST-INJECTION HEALTH CHECK: Verify node is still responsive after
+        // injection tests.  Malformed HTTP payloads can corrupt bitcoind's
+        // HTTP parser state and exhaust the RPC work queue.  If the node is
+        // unresponsive, restart it so subsequent engines (consensus, wallet,
+        // etc.) are not blocked.
+        {
+            bool node_ok = false;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                auto hc = rpc_fast(inst, "getblockcount", "[]");
+                if (hc.success && !hc.is_error()) { node_ok = true; break; }
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            if (!node_ok) {
+                EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_rpc",
+                    ver + ": Node unresponsive after injection tests — restarting bitcoind");
+                // Stop the node
+                rpc_fast(inst, "stop");
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                // Kill if still running
+                if (inst.pid > 0) {
+                    kill(inst.pid, SIGTERM);
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    kill(inst.pid, SIGKILL);
+                    waitpid(inst.pid, nullptr, WNOHANG);
+                }
+                // Restart
+                std::string cmd = inst.binary_path +
+                    " -regtest -datadir=" + inst.data_directory +
+                    " -rpcuser=" + inst.rpc_user +
+                    " -rpcpassword=" + inst.rpc_password +
+                    " -rpcport=" + std::to_string(inst.rpc_port) +
+                    " -rpcworkqueue=64 -rpcthreads=8"
+                    " -daemon -server -listen=0 -listenonion=0"
+                    " -txindex=0 -disablewallet=0 -fallbackfee=0.0001"
+                    " 2>/dev/null";
+                system(cmd.c_str());
+                std::this_thread::sleep_for(std::chrono::seconds(4));
+                // Wait for RPC to come back
+                for (int rr = 0; rr < 15; ++rr) {
+                    auto pp = rpc_fast(inst, "getblockcount", "[]");
+                    if (pp.success && !pp.is_error()) { node_ok = true; break; }
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                }
+                if (node_ok) {
+                    EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_rpc",
+                        ver + ": Node restarted successfully after injection tests");
+                } else {
+                    EnhancedStructuredLogger::instance()->log(LogLevel::ERROR, "engine_rpc",
+                        ver + ": Node failed to restart after injection tests");
+                }
+            }
+        }
 
         return results;
     }
