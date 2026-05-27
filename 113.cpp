@@ -56930,6 +56930,15 @@ public:
         std::vector<DynamicFinding> results;
         std::string ver = inst.version_string;
 
+        // Cooperative deadline: stop adding new tests once we approach the
+        // 120 s engine timeout.  Budget 90 s for all sub-tests so the
+        // function returns well before the caller's future::wait_for fires.
+        auto cs_start = std::chrono::steady_clock::now();
+        auto cs_budget = std::chrono::seconds(90);
+        auto cs_expired = [&]() {
+            return (std::chrono::steady_clock::now() - cs_start) >= cs_budget;
+        };
+
         // Test 1: Regtest difficulty
         if (!p.difficulty_bits.empty() && p.difficulty_bits != "207fffff") {
             results.push_back(make_finding(ver, "consensus", "CS-DIFFICULTY-UNEXPECTED",
@@ -57227,13 +57236,14 @@ public:
         // DEEP ENHANCEMENT: CS-CLTV-BOUNDARY — locktime boundary testing
         // Tests CLTV at specific boundaries: height vs time, MTP transition
         // ================================================================
-        if (!p.test_addresses.empty()) {
+        if (!p.test_addresses.empty() && !cs_expired()) {
             auto cnt = rpc_fast(inst, "getblockcount");
             if (cnt.success) {
                 int height = 0; try { height = std::stoi(cnt.output); } catch (...) {}
-                // Test locktime at current height + various offsets
-                std::vector<int> offsets = {-5, -1, 0, 1, 5, 10};
+                // Test locktime at key boundary offsets (reduced from 6 to 3)
+                std::vector<int> offsets = {-1, 0, 1};
                 for (int off : offsets) {
+                    if (cs_expired()) break;
                     int lock_h = height + off;
                     if (lock_h < 1) continue;
                     auto cu = rpc_fast(inst, "listunspent", "1 9999999");
@@ -57281,7 +57291,7 @@ public:
         // DEEP ENHANCEMENT: CS-INVALID-SUBMITBLOCK — submit crafted invalid blocks
         // Tests rejection of blocks with various invalid properties
         // ================================================================
-        {
+        if (!cs_expired()) {
             // Type 1: All-zero block header (invalid hash)
             std::string zero_block(160, '0');
             auto sub1 = rpc_fast(inst, "submitblock", zero_block);
@@ -57324,7 +57334,7 @@ public:
         // ENGINE 5 DEEP: CSV relative locktime boundary testing
         // NOVELTY DECLARATION — CS-CSV-BOUNDARY
         // ================================================================
-        if (!p.test_addresses.empty()) {
+        if (!p.test_addresses.empty() && !cs_expired()) {
             std::string caddr = p.test_addresses[0];
             // Create a transaction, mine it, then test CSV relative lock
             auto cu = rpc_fast(inst, "listunspent", "1 9999999");
@@ -57372,7 +57382,7 @@ public:
         // NOVELTY DECLARATION — CS-DISABLED-OP-EXEC
         // Creates P2SH with disabled opcode, funds it, attempts to spend
         // ================================================================
-        if (!p.test_addresses.empty() && !p.utxos.empty()) {
+        if (!p.test_addresses.empty() && !p.utxos.empty() && !cs_expired()) {
             // Test top 3 disabled opcodes with actual P2SH execution
             std::vector<std::pair<std::string, std::string>> exec_ops = {
                 {"OP_CAT", "7e"}, {"OP_MUL", "95"}, {"OP_AND", "84"}
@@ -57404,16 +57414,21 @@ public:
 
         // ================================================================
         // E5 DEEP: ALL 15 disabled opcodes — P2SH fund + execution attempt
+        // PERF FIX: batch all sendtoaddress calls, then mine ONCE instead
+        // of mining a block after each individual fund (15× → 1× mining).
         // ================================================================
-        if (!p.test_addresses.empty()) {
+        if (!p.test_addresses.empty() && !cs_expired()) {
             std::vector<std::pair<std::string,std::string>> all_disabled = {
                 {"OP_CAT","7e"},{"OP_SUBSTR","7f"},{"OP_LEFT","80"},{"OP_RIGHT","81"},
                 {"OP_INVERT","83"},{"OP_AND","84"},{"OP_OR","85"},{"OP_XOR","86"},
                 {"OP_2MUL","8d"},{"OP_2DIV","8e"},{"OP_MUL","95"},{"OP_DIV","96"},
                 {"OP_MOD","97"},{"OP_LSHIFT","98"},{"OP_RSHIFT","99"}
             };
+            // Phase 1: fund all P2SH addresses without mining between each
+            struct FundedOp { std::string name; std::string p2sh; std::string txid; };
+            std::vector<FundedOp> funded;
             for (auto& [opnm, ophx] : all_disabled) {
-                // Script: OP_1 OP_1 <disabled_op>
+                if (cs_expired()) break;
                 std::string redeem = "5151" + ophx;
                 auto dsc = rpc_fast(inst, "decodescript", "\"" + redeem + "\"");
                 if (dsc.success) {
@@ -57421,21 +57436,28 @@ public:
                     if (!p2sh.empty() && p2sh.size() > 10) {
                         auto fund = rpc_fast(inst, "sendtoaddress", p2sh + " 0.0005");
                         if (fund.success && !fund.is_error() && fund.output.size() == 64) {
-                            rpc_fast(inst, "generatetoaddress", "1 " + p.test_addresses[0]);
-                            results.push_back(make_finding(ver, "consensus",
-                                "CS-DISABLED-OP-EXEC-" + opnm,
-                                "P2SH with " + opnm + " funded. Spending would fail at consensus layer.",
-                                "p2sh=" + p2sh.substr(0,15) + " fund_txid=" + fund.output.substr(0,16), 1));
+                            funded.push_back({opnm, p2sh, fund.output});
                         }
                     }
                 }
+            }
+            // Phase 2: mine ONE block to confirm all funded txs
+            if (!funded.empty()) {
+                rpc_fast(inst, "generatetoaddress", "1 " + p.test_addresses[0]);
+            }
+            // Phase 3: emit findings
+            for (auto& f : funded) {
+                results.push_back(make_finding(ver, "consensus",
+                    "CS-DISABLED-OP-EXEC-" + f.name,
+                    "P2SH with " + f.name + " funded. Spending would fail at consensus layer.",
+                    "p2sh=" + f.p2sh.substr(0,15) + " fund_txid=" + f.txid.substr(0,16), 1));
             }
         }
 
         // ================================================================
         // E5 DEEP: Sigop boundary — test near 80,000 legacy sigops
         // ================================================================
-        {
+        if (!cs_expired()) {
             // Create script with many OP_CHECKSIG (0xac) to probe sigop limit
             // Each OP_CHECKSIG = 1 sigop. P2SH redeemscript max 520 bytes.
             // 520 bytes of OP_CHECKSIG = 520 sigops per output
@@ -57456,7 +57478,7 @@ public:
         // E5 DEEP: Witness version matrix across 6 version points
         // Test v0-v16 witness programs, record acceptance behavior per version
         // ================================================================
-        {
+        if (!cs_expired()) {
             double ver_num = 0;
             try {
                 std::string vn = ver;
@@ -57492,7 +57514,7 @@ public:
         }
 
         // ENHANCEMENT: Script validation tests — oversized scripts, opcode limits, disabled opcodes
-        {
+        if (!cs_expired()) {
             // Test 1: Oversized script (>10,000 bytes) — should be rejected
             std::string oversized_script(10002 * 2, '0'); // 10002 bytes as hex
             auto dec_over = rpc_fast(inst, "decodescript", "\"" + oversized_script + "\"");
@@ -57537,7 +57559,7 @@ public:
         }
 
         // ENHANCEMENT: Witness validation — unknown witness versions, oversized stack items
-        {
+        if (!cs_expired()) {
             // Test: witness stack item >10,000 bytes
             // Construct a segwit v0 P2WSH script with oversized witness
             // We can test via validateaddress and decodescript
@@ -57566,7 +57588,7 @@ public:
         }
 
         // ENHANCEMENT: Sigop limit — test at exactly limit and one over
-        {
+        if (!cs_expired()) {
             // Bitcoin Core limit: 80,000 sigops per block
             // Each OP_CHECKSIG = 1 sigop, OP_CHECKMULTISIG = up to 20 sigops
             // We can verify the limit is enforced by checking getblocktemplate constraints
@@ -57588,7 +57610,7 @@ public:
         }
 
         // ENHANCEMENT: Block-level — duplicate txid, bad merkle root, invalid coinbase
-        {
+        if (!cs_expired()) {
             // Test: invalid coinbase via submitblock with crafted block
             // We can test the node's response to a block with no transactions
             auto gbt = rpc_fast(inst, "getblocktemplate", "{\"rules\":[\"segwit\"]}");
@@ -57611,7 +57633,7 @@ public:
         // 2-16 with varying program lengths to detect version-specific
         // validation inconsistencies that could allow consensus splits.
         // ================================================================
-        {
+        if (!cs_expired()) {
             std::vector<int> test_lengths = {2, 10, 20, 32, 40};
             for (int wv = 2; wv <= 16; wv += 7) { // Test v2, v9, v16
                 for (int plen : test_lengths) {
@@ -57647,7 +57669,7 @@ public:
         // CS-NOVEL-OPCODE-LIMIT-EXACT: Test script opcode count at exactly
         // 201 (the limit) and 202 (one over) to verify exact enforcement.
         // ================================================================
-        {
+        if (!cs_expired()) {
             // Exactly 201 OP_NOP opcodes — should be accepted
             std::string script_201;
             for (int i = 0; i < 201; i++) script_201 += "61"; // OP_NOP
@@ -57677,7 +57699,7 @@ public:
 
         // NOVEL METHOD: CS-NOVEL-WITNESS-PROGRAM-LENGTH (ENHANCED)
         // Test ALL witness versions × multiple lengths, track acceptance pattern
-        {
+        if (!cs_expired()) {
             struct WPTest { int version; int len; std::string hex; };
             std::vector<WPTest> tests;
             for (int wv : {0, 1, 2, 16}) {
@@ -57691,7 +57713,7 @@ public:
             }
             int accepted = 0, rejected = 0;
             for (auto& t : tests) {
-                auto d = rpc(inst, "decodescript", "\"" + t.hex + "\"");
+                auto d = rpc_fast(inst, "decodescript", "\"" + t.hex + "\"");
                 std::string type = jx(d.output, "type");
                 bool is_witness = type.find("witness") != std::string::npos;
                 if (is_witness) accepted++; else rejected++;
@@ -57706,8 +57728,8 @@ public:
 
         // NOVEL METHOD: CS-NOVEL-BLOCK-WEIGHT-BOUNDARY (ENHANCED)
         // Check GBT weight limit AND actual block stats
-        {
-            auto gbt = rpc(inst, "getblocktemplate", "'{\"rules\":[\"segwit\"]}'");
+        if (!cs_expired()) {
+            auto gbt = rpc_fast(inst, "getblocktemplate", "{\"rules\":[\"segwit\"]}");
             if (gbt.success) {
                 std::string wl = jx(gbt.output, "weightlimit");
                 std::string sl = jx(gbt.output, "sizelimit");
@@ -57717,11 +57739,11 @@ public:
                 int tx_count = 0;
                 { size_t pp = 0; while ((pp = gbt.output.find("\"data\":", pp)) != std::string::npos) { tx_count++; pp++; } }
                 // Also check actual tip block weight
-                auto bi = rpc(inst, "getblockchaininfo");
+                auto bi = rpc_fast(inst, "getblockchaininfo");
                 std::string best = jx(bi.output, "bestblockhash");
                 int tip_weight = 0;
                 if (!best.empty()) {
-                    auto blk = rpc(inst, "getblock", "\"" + best + "\"");
+                    auto blk = rpc_fast(inst, "getblock", "\"" + best + "\"");
                     std::string bw = jx(blk.output, "weight");
                     try { tip_weight = std::stoi(bw); } catch(...) {}
                 }
@@ -57738,8 +57760,8 @@ public:
 
         // NOVEL METHOD: CS-NOVEL-VERSION-BITS-SURVEY (ENHANCED)
         // Parse all softfork names and states
-        {
-            auto bci = rpc(inst, "getblockchaininfo");
+        if (!cs_expired()) {
+            auto bci = rpc_fast(inst, "getblockchaininfo");
             if (bci.success) {
                 auto count_state = [&](const std::string& state) {
                     int c = 0; size_t pp = 0;
@@ -57766,8 +57788,8 @@ public:
         }
 
         // NOVEL METHOD: CS-NOVEL-GBT-MUTABLE-FIELDS (ENHANCED)
-        {
-            auto gbt = rpc(inst, "getblocktemplate", "'{\"rules\":[\"segwit\"]}'");
+        if (!cs_expired()) {
+            auto gbt = rpc_fast(inst, "getblocktemplate", "{\"rules\":[\"segwit\"]}");
             if (gbt.success) {
                 std::vector<std::string> mutable_found;
                 for (const char* f : {"time", "transactions", "prevblock", "coinbase/append",
@@ -57789,8 +57811,8 @@ public:
 
         // NOVEL METHOD: CS-NOVEL-BIP68-RELATIVE-LOCKTIME (ENHANCED)
         // Test both time-based and height-based CSV with actual tx construction
-        {
-            auto utxos = rpc(inst, "listunspent", "1 9999");
+        if (!cs_expired()) {
+            auto utxos = rpc_fast(inst, "listunspent", "[1, 9999]");
             std::string txid = jx(utxos.output, "txid");
             auto addr = rpc_safe(inst, "getnewaddress");
             if (!txid.empty() && !addr.empty()) {
@@ -57803,7 +57825,7 @@ public:
                 for (auto& t : tests) {
                     std::string inp = "'[{\"txid\":\"" + txid + "\",\"vout\":0,\"sequence\":" +
                         std::to_string(t.seq) + "}]'";
-                    auto raw = rpc(inst, "createrawtransaction", inp + " '{\"" + addr + "\":0.001}'");
+                    auto raw = rpc_fast(inst, "createrawtransaction", inp + " '{\"" + addr + "\":0.001}'");
                     if (raw.success) created++;
                 }
                 results.push_back(make_finding(ver, "consensus", "CS-NOVEL-BIP68-CSV-MATRIX",
@@ -57816,13 +57838,13 @@ public:
 
 
         // VERSION-ADAPTIVE CS TESTS
-        {
+        if (!cs_expired()) {
             auto caps = get_caps(ver);
             int em = effective_major(ver);
 
             // Taproot activation status (only meaningful >= 22)
             if (caps.has_taproot) {
-                auto bci = rpc(inst, "getblockchaininfo");
+                auto bci = rpc_fast(inst, "getblockchaininfo");
                 bool taproot_active = bci.output.find("\"taproot\"") != std::string::npos;
                 std::string deploy_status = "unavailable";
                 if (taproot_active) {
@@ -57840,7 +57862,7 @@ public:
 
             // v23+: getdeploymentinfo gives more detail than getblockchaininfo
             if (caps.has_getdeplinfo) {
-                auto di = rpc(inst, "getdeploymentinfo");
+                auto di = rpc_fast(inst, "getdeploymentinfo");
                 if (di.success && !di.is_error()) {
                     int deployments = 0;
                     size_t pp = 0;
@@ -57854,7 +57876,7 @@ public:
 
             // Pre-segwit era consistency check (0.16.x)
             if (em <= 16) {
-                auto bci = rpc(inst, "getblockchaininfo");
+                auto bci = rpc_fast(inst, "getblockchaininfo");
                 bool segwit_active = bci.output.find("\"segwit\"") != std::string::npos;
                 results.push_back(make_finding(ver, "consensus",
                     segwit_active ? "CS-SEGWIT-ERA-TRANSITION" : "CS-PRE-SEGWIT",
