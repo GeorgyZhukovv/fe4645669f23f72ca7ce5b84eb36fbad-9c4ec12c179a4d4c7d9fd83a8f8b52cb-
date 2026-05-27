@@ -48223,22 +48223,26 @@ public:
             return deep_static_analysis(inst, params);
         });
 
-        // Collect batch 1
-        auto cs = cs_future.get();
-        all.insert(all.end(), cs.begin(), cs.end());
-        log("consensus", "CS-* complete", cs.size());
+        // Collect batch 1 — each future gets a 120s deadline so a hung
+        // engine cannot block the entire batch indefinitely.
+        constexpr auto kEngineTimeout = std::chrono::seconds(120);
 
-        auto ra = ra_future.get();
-        all.insert(all.end(), ra.begin(), ra.end());
-        log("rpc", "RPC-* complete", ra.size());
+        auto collect = [&](auto& fut, const char* name, const char* tag) {
+            if (fut.wait_for(kEngineTimeout) == std::future_status::ready) {
+                auto v = fut.get();
+                all.insert(all.end(), v.begin(), v.end());
+                log(name, std::string(tag) + " complete", v.size());
+            } else {
+                EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_parallel",
+                    inst.version_string + ": " + std::string(tag) + " TIMED OUT after 120s — skipping");
+                log(name, std::string(tag) + " TIMED OUT", 0);
+            }
+        };
 
-        auto bf = bf_future.get();
-        all.insert(all.end(), bf.begin(), bf.end());
-        log("fuzz", "FUZZ-* complete", bf.size());
-
-        auto sa = sa_future.get();
-        all.insert(all.end(), sa.begin(), sa.end());
-        log("static", "SA-* complete", sa.size());
+        collect(cs_future,  "consensus", "CS-*");
+        collect(ra_future,  "rpc",       "RPC-*");
+        collect(bf_future,  "fuzz",      "FUZZ-*");
+        collect(sa_future,  "static",    "SA-*");
 
         // BATCH 2
         EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_parallel",
@@ -48269,22 +48273,11 @@ public:
             return deep_novel_leakage(inst, params, have_wallet);
         });
 
-        // Collect batch 2
-        auto ws = ws_future.get();
-        all.insert(all.end(), ws.begin(), ws.end());
-        log("wallet", "WAL-* complete", ws.size());
-
-        auto mp = mp_future.get();
-        all.insert(all.end(), mp.begin(), mp.end());
-        log("mempool", "MP-* complete", mp.size());
-
-        auto p2p = p2p_future.get();
-        all.insert(all.end(), p2p.begin(), p2p.end());
-        log("p2p", "P2P-* complete", p2p.size());
-
-        auto nl = nl_future.get();
-        all.insert(all.end(), nl.begin(), nl.end());
-        log("novel_leakage", "KL-NOVEL-* complete", nl.size());
+        // Collect batch 2 — same 120s deadline per engine
+        collect(ws_future,  "wallet",        "WAL-*");
+        collect(mp_future,  "mempool",       "MP-*");
+        collect(p2p_future, "p2p",           "P2P-*");
+        collect(nl_future,  "novel_leakage", "KL-NOVEL-*");
 
         EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_parallel",
             inst.version_string + ": All parallel engines complete");
@@ -62125,11 +62118,9 @@ public:
                 if (file_exists(lp)) {
                     // Read last 100 lines
                     std::string tail_cmd = "tail -100 " + lp + " 2>/dev/null";
-                    FILE* tp = popen(tail_cmd.c_str(), "r");
-                    if (tp) {
-                        std::string tail_out; char buf[4096];
-                        while (fgets(buf, sizeof(buf), tp)) tail_out += buf;
-                        pclose(tp);
+                    auto tail_pr = popen_with_timeout(tail_cmd, 10);
+                    if (!tail_pr.timed_out) {
+                        std::string tail_out = tail_pr.output;
                         bool key_in_tail = false;
                         // Check if any private key material appeared
                         auto pk = rpc(inst, "dumpprivkey", test_addr2);
@@ -63173,11 +63164,8 @@ private:
                 "-d '{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}' "
                 "-H 'Content-Type: application/json' http://127.0.0.1:" +
                 std::to_string(inst.rpc_port) + "/ 2>&1";
-            FILE* pp = popen(curl.c_str(), "r");
-            if (pp) {
-                std::string o; char b[4096];
-                while (fgets(b, sizeof(b), pp)) o += b;
-                if (pclose(pp) == 0 && o.find("bestblockhash") != std::string::npos)
+            { auto pr_ua = popen_with_timeout(curl, 10);
+                if (!pr_ua.timed_out && pr_ua.exit_status == 0 && pr_ua.output.find("bestblockhash") != std::string::npos)
                     res.push_back(mkf(inst.version_string, "rpc", "RPC-UNAUTH",
                         "Unauthenticated RPC access succeeded", "", 10));
             }
