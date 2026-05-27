@@ -57693,6 +57693,25 @@ public:
         std::vector<DynamicFinding> results;
         std::string ver = inst.version_string;
 
+        // PRE-CHECK: Verify node is responsive before running RPC tests.
+        // A previous engine (e.g. key-leakage) may have left the node busy
+        // or the RPC work queue saturated.  A quick getblockcount via the
+        // socket-based rpc_fast (10 s wall-clock cap) confirms liveness and
+        // lets any queued work drain before we start forking bitcoin-cli
+        // processes that would otherwise pile up and timeout.
+        {
+            auto alive = rpc_fast(inst, "getblockcount");
+            if (!alive.success) {
+                // Node not responding — wait briefly and retry once
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                alive = rpc_fast(inst, "getblockcount");
+                if (!alive.success) {
+                    results.push_back(make_finding(ver, "rpc", "RPC-NODE-UNRESPONSIVE",
+                        "Node unresponsive at RPC engine start — skipping CLI-based auth tests", "", 5));
+                }
+            }
+        }
+
         // Test 1: Unauthenticated access via curl
         {
             std::string cmd = "curl -sf --connect-timeout 3 --max-time 5 "
@@ -57712,11 +57731,17 @@ public:
         }
 
         // Test 2: Wrong credentials
+        // FIX (0.19.1 timeout): bitcoin-cli with wrong -rpcuser/-rpcpassword hangs
+        // on 0.19.1+ because the server holds the connection open on auth failure
+        // (anti-brute-force delay).  Use curl with strict --max-time instead,
+        // matching the pattern already used for RPC-AUTH-SWAP tests below.
         {
-            std::string cmd = cli_for(inst) + " -regtest -datadir=" + inst.data_directory +
-                " -rpcuser=" + inst.rpc_user + " -rpcpassword=WRONG_PASSWORD_12345" +
-                " -rpcport=" + std::to_string(inst.rpc_port) + " getblockchaininfo 2>&1";
-            PopenResult wrong_pr = popen_with_timeout(cmd, 30);
+            std::string cmd = "curl -sf --connect-timeout 3 --max-time 5"
+                " -u " + inst.rpc_user + ":WRONG_PASSWORD_12345"
+                " -d '{\"jsonrpc\":\"1.0\",\"method\":\"getblockchaininfo\",\"params\":[]}'"
+                " -H 'Content-Type: application/json'"
+                " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
+            PopenResult wrong_pr = popen_with_timeout(cmd, 10);
             if (!wrong_pr.timed_out) {
                 if (wrong_pr.exit_status == 0 && wrong_pr.output.find("bestblockhash") != std::string::npos) {
                     results.push_back(make_finding(ver, "rpc", "RPC-WRONG-CREDS",
@@ -57729,11 +57754,16 @@ public:
         }
 
         // Test 3: Empty credentials
+        // FIX (0.19.1 timeout): same root cause as Test 2 — bitcoin-cli hangs
+        // when the server delays/holds the connection on empty-credential auth
+        // failure.  Use curl with strict --max-time to bound the request.
         {
-            std::string cmd = cli_for(inst) + " -regtest -datadir=" + inst.data_directory +
-                " -rpcuser= -rpcpassword= -rpcport=" + std::to_string(inst.rpc_port) +
-                " getnetworkinfo 2>&1";
-            PopenResult empty_pr = popen_with_timeout(cmd, 30);
+            std::string cmd = "curl -sf --connect-timeout 3 --max-time 5"
+                " -u :"
+                " -d '{\"jsonrpc\":\"1.0\",\"method\":\"getnetworkinfo\",\"params\":[]}'"
+                " -H 'Content-Type: application/json'"
+                " http://127.0.0.1:" + std::to_string(inst.rpc_port) + "/ 2>&1";
+            PopenResult empty_pr = popen_with_timeout(cmd, 10);
             if (!empty_pr.timed_out) {
                 if (empty_pr.exit_status == 0 && empty_pr.output.find("version") != std::string::npos) {
                     results.push_back(make_finding(ver, "rpc", "RPC-EMPTY-CREDS",
