@@ -42510,9 +42510,9 @@ struct DynamicVerificationConfig {
     std::string wallet_encryption_passphrase = "audit_test_passphrase_123";
     // High-throughput mode: increased RPC capacity for parallel engine runs
     bool high_throughput = false;
-    int ht_rpcthreads = 64;
-    int ht_rpcworkqueue = 512;
-    int ht_rpcservertimeout = 120;
+    int ht_rpcthreads = 16;
+    int ht_rpcworkqueue = 64;
+    int ht_rpcservertimeout = 60;
 };
 
 DynamicVerificationConfig parse_dynamic_flag(int argc, char** argv) {
@@ -46562,10 +46562,10 @@ struct UnifiedAuditConfig {
     int external_call_timeout_seconds = POPEN_TIMEOUT_DEFAULT;
     // Wallet encryption passphrase for key-leakage tests
     std::string wallet_encryption_passphrase = "audit_test_passphrase_123";
-    // High-throughput RPC capacity settings (configurable, defaults to high-capacity)
-    int ht_rpcthreads = 64;
-    int ht_rpcworkqueue = 512;
-    int ht_rpcservertimeout = 120;
+    // High-throughput RPC capacity settings (configurable, defaults to stable parallel values)
+    int ht_rpcthreads = 16;
+    int ht_rpcworkqueue = 64;
+    int ht_rpcservertimeout = 60;
 };
 
 UnifiedAuditConfig parse_audit_flags(int argc, char** argv) {
@@ -65554,9 +65554,9 @@ CONFIGURATION:
   --dry-run            Same as --audit-dry-run
   --high-throughput    Launch bitcoind with high-capacity RPC settings
                        (auto-enabled by --audit-deep)
-  --ht-rpcthreads=N    RPC threads for high-throughput mode (default: 64)
-  --ht-rpcworkqueue=N  RPC work queue depth (default: 512)
-  --ht-rpcservertimeout=N  RPC server timeout in seconds (default: 120)
+  --ht-rpcthreads=N    RPC threads for high-throughput mode (default: 16)
+  --ht-rpcworkqueue=N  RPC work queue depth (default: 64)
+  --ht-rpcservertimeout=N  RPC server timeout in seconds (default: 60)
 
 OUTPUT:
   --help, -h           Show this help message
