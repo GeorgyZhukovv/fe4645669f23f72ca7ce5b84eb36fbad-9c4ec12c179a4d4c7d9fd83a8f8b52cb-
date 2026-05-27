@@ -42508,6 +42508,11 @@ struct DynamicVerificationConfig {
     int rpc_timeout_seconds = POPEN_TIMEOUT_DEFAULT;
     int external_call_timeout_seconds = POPEN_TIMEOUT_DEFAULT;
     std::string wallet_encryption_passphrase = "audit_test_passphrase_123";
+    // High-throughput mode: increased RPC capacity for parallel engine runs
+    bool high_throughput = false;
+    int ht_rpcthreads = 64;
+    int ht_rpcworkqueue = 512;
+    int ht_rpcservertimeout = 120;
 };
 
 DynamicVerificationConfig parse_dynamic_flag(int argc, char** argv) {
@@ -42564,6 +42569,23 @@ DynamicVerificationConfig parse_dynamic_flag(int argc, char** argv) {
             config.rpc_base_port = std::stoi(arg.substr(23));
         } else if (arg.find("--dynamic-osx-dir=") == 0) {
             config.osx_archive_directory = arg.substr(18);
+        } else if (arg == "--high-throughput") {
+            config.high_throughput = true;
+        } else if (arg.find("--ht-rpcthreads=") == 0) {
+            config.ht_rpcthreads = std::stoi(arg.substr(16));
+        } else if (arg.find("--ht-rpcworkqueue=") == 0) {
+            config.ht_rpcworkqueue = std::stoi(arg.substr(18));
+        } else if (arg.find("--ht-rpcservertimeout=") == 0) {
+            config.ht_rpcservertimeout = std::stoi(arg.substr(21));
+        }
+    }
+
+    // --audit-deep (parsed elsewhere) auto-enables high-throughput;
+    // also check if --dynamic was combined with --audit-deep
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--audit-deep") {
+            config.high_throughput = true;
+            break;
         }
     }
 
@@ -43011,9 +43033,24 @@ public:
              << "rpcport=" << instance.rpc_port << "\n"
              << "port=" << instance.p2p_port << "\n"
              << "rpcallowip=127.0.0.1\n"
-             << "rpcbind=127.0.0.1\n"
-             << "rpcworkqueue=128\n"
-             << "rpcthreads=8\n";
+             << "rpcbind=127.0.0.1\n";
+
+        // High-throughput mode: use configurable high-capacity RPC settings
+        if (config_.high_throughput) {
+            conf << "rpcthreads=" << config_.ht_rpcthreads << "\n"
+                 << "rpcworkqueue=" << config_.ht_rpcworkqueue << "\n";
+            // rpcservertimeout is supported in Bitcoin Core 0.20+ (approx);
+            // older versions silently ignore unknown options in bitcoin.conf
+            conf << "rpcservertimeout=" << config_.ht_rpcservertimeout << "\n";
+            EnhancedStructuredLogger::instance()->log(LogLevel::INFO,
+                "version_manager",
+                "High-throughput RPC: threads=" + std::to_string(config_.ht_rpcthreads) +
+                " workqueue=" + std::to_string(config_.ht_rpcworkqueue) +
+                " servertimeout=" + std::to_string(config_.ht_rpcservertimeout));
+        } else {
+            conf << "rpcworkqueue=128\n"
+                 << "rpcthreads=8\n";
+        }
         conf.close();
 
         instances_.push_back(instance);
@@ -46508,6 +46545,7 @@ struct UnifiedAuditConfig {
     bool deep_mode = false;         // --audit-deep
     bool quick_mode = false;        // --audit-quick
     bool novel_mode = false;        // --audit-novel
+    bool high_throughput = false;   // --high-throughput (auto-enabled by --audit-deep)
     bool static_feeds_dynamic = true;
     bool dynamic_feeds_static = true;
     int min_severity_for_dynamic = 4;
@@ -46524,6 +46562,10 @@ struct UnifiedAuditConfig {
     int external_call_timeout_seconds = POPEN_TIMEOUT_DEFAULT;
     // Wallet encryption passphrase for key-leakage tests
     std::string wallet_encryption_passphrase = "audit_test_passphrase_123";
+    // High-throughput RPC capacity settings (configurable, defaults to high-capacity)
+    int ht_rpcthreads = 64;
+    int ht_rpcworkqueue = 512;
+    int ht_rpcservertimeout = 120;
 };
 
 UnifiedAuditConfig parse_audit_flags(int argc, char** argv) {
@@ -46534,6 +46576,10 @@ UnifiedAuditConfig parse_audit_flags(int argc, char** argv) {
         else if (arg == "--audit-deep") { cfg.enabled = true; cfg.deep_mode = true; }
         else if (arg == "--audit-quick") { cfg.enabled = true; cfg.quick_mode = true; }
         else if (arg == "--audit-novel") { cfg.enabled = true; cfg.novel_mode = true; cfg.min_severity_for_dynamic = 1; }
+        else if (arg == "--high-throughput") { cfg.high_throughput = true; }
+        else if (arg.find("--ht-rpcthreads=") == 0) cfg.ht_rpcthreads = std::stoi(arg.substr(16));
+        else if (arg.find("--ht-rpcworkqueue=") == 0) cfg.ht_rpcworkqueue = std::stoi(arg.substr(18));
+        else if (arg.find("--ht-rpcservertimeout=") == 0) cfg.ht_rpcservertimeout = std::stoi(arg.substr(21));
         else if (arg.find("--audit-versions=") == 0) {
             cfg.enabled = true;
             cfg.target_versions = split_string(arg.substr(17), ',');
@@ -46544,6 +46590,8 @@ UnifiedAuditConfig parse_audit_flags(int argc, char** argv) {
         else if (arg == "--audit-dry-run") { cfg.enabled = true; cfg.dry_run = true; }
         else if (arg == "--audit-no-feedback") { cfg.static_feeds_dynamic = false; cfg.dynamic_feeds_static = false; }
     }
+    // --audit-deep automatically enables --high-throughput
+    if (cfg.deep_mode) cfg.high_throughput = true;
     return cfg;
 }
 
@@ -47086,6 +47134,123 @@ private:
                         r.output.find("\"result\"") != std::string::npos;
         }
         return r;
+    }
+
+    // ================================================================
+    // BATCH RPC HELPER — sends a JSON-RPC batch array in a single call,
+    // drastically reducing the number of popen/curl invocations.
+    // Returns a vector of RpcResult, one per request in the batch.
+    // Falls back to individual calls if batching fails (old versions).
+    // ================================================================
+    struct BatchEntry {
+        std::string method;
+        std::string params;  // JSON params string, e.g. "[]" or "[\"segwit\"]"
+    };
+
+    static std::vector<RpcResult> rpc_batch(const VersionInstance& inst,
+                                             const std::vector<BatchEntry>& entries,
+                                             int timeout_sec = 30) {
+        std::vector<RpcResult> results(entries.size());
+        if (entries.empty()) return results;
+
+        // Build JSON-RPC batch array
+        std::string batch = "[";
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (i > 0) batch += ",";
+            std::string params_json = entries[i].params.empty() ? "[]" : entries[i].params;
+            batch += "{\"jsonrpc\":\"1.0\",\"id\":\"b" + std::to_string(i) +
+                     "\",\"method\":\"" + entries[i].method +
+                     "\",\"params\":" + params_json + "}";
+        }
+        batch += "]";
+
+        // Use curl with --max-time to POST the batch (avoids bitcoin-cli
+        // limitations and enforces strict timeout — preserves 0.19.1 fix)
+        std::string auth = inst.rpc_user + ":" + inst.rpc_password;
+        std::string wp = inst.wallet_name.empty() ? "/" : "/wallet/" + inst.wallet_name;
+        std::string url = "http://127.0.0.1:" + std::to_string(inst.rpc_port) + wp;
+
+        // Escape single quotes in batch payload for shell safety
+        std::string escaped_batch;
+        escaped_batch.reserve(batch.size() + 64);
+        for (char c : batch) {
+            if (c == '\'') escaped_batch += "'\\''";
+            else escaped_batch += c;
+        }
+
+        std::string curl_cmd = "curl -sf --max-time " + std::to_string(timeout_sec) +
+            " -u '" + auth + "'"
+            " -H 'Content-Type: application/json'"
+            " -d '" + escaped_batch + "'"
+            " '" + url + "' 2>/dev/null";
+
+        auto pr = popen_with_timeout(curl_cmd, timeout_sec + 5);
+
+        if (pr.timed_out || pr.exit_status != 0 || pr.output.empty()) {
+            // Batch failed — fall back to individual calls with tighter timeout
+            Logger::instance().warning("rpc_batch: batch call failed (timeout=" +
+                std::string(pr.timed_out ? "Y" : "N") + " exit=" +
+                std::to_string(pr.exit_status) + "), falling back to individual calls");
+            for (size_t i = 0; i < entries.size(); ++i) {
+                results[i] = rpc(inst, entries[i].method, entries[i].params);
+            }
+            return results;
+        }
+
+        // Parse the JSON array response.
+        // Response is an array of objects: [{"result":...,"error":...,"id":"b0"}, ...]
+        // We do lightweight parsing keyed on the "id" field.
+        const std::string& raw = pr.output;
+
+        // Verify it starts with '['
+        size_t arr_start = raw.find('[');
+        if (arr_start == std::string::npos) {
+            // Not a batch response — maybe the version doesn't support batching
+            Logger::instance().warning("rpc_batch: non-array response, falling back");
+            for (size_t i = 0; i < entries.size(); ++i) {
+                results[i] = rpc(inst, entries[i].method, entries[i].params);
+            }
+            return results;
+        }
+
+        // Extract individual response objects by scanning for "id":"bN"
+        for (size_t i = 0; i < entries.size(); ++i) {
+            std::string id_marker = "\"id\":\"b" + std::to_string(i) + "\"";
+            size_t id_pos = raw.find(id_marker);
+            if (id_pos == std::string::npos) {
+                // Try without quotes around id (some versions return numeric id)
+                id_marker = "\"id\":b" + std::to_string(i);
+                id_pos = raw.find(id_marker);
+            }
+            if (id_pos == std::string::npos) {
+                results[i].success = false;
+                results[i].output = "";
+                continue;
+            }
+
+            // Find the enclosing {} for this response object
+            // Scan backwards from id_pos to find '{'
+            size_t obj_start = raw.rfind('{', id_pos);
+            if (obj_start == std::string::npos) { results[i].success = false; continue; }
+
+            // Scan forward to find matching '}'
+            int depth = 0;
+            size_t obj_end = obj_start;
+            for (size_t j = obj_start; j < raw.size(); ++j) {
+                if (raw[j] == '{') depth++;
+                else if (raw[j] == '}') {
+                    depth--;
+                    if (depth == 0) { obj_end = j; break; }
+                }
+            }
+            std::string obj = raw.substr(obj_start, obj_end - obj_start + 1);
+            results[i].output = obj;
+            results[i].success = obj.find("\"error\":null") != std::string::npos ||
+                                  (obj.find("\"result\"") != std::string::npos &&
+                                   obj.find("\"error\"") == std::string::npos);
+        }
+
+        return results;
     }
 
     static std::string jx(const std::string& json, const std::string& key) {
@@ -48129,44 +48294,64 @@ public:
         // VERSION DIFFERENTIATOR — produces unique findings per version build
         // Solves uniformity: patch versions (0.17.1 vs 0.17.2) now produce
         // different finding counts based on actual behavioral differences.
+        //
+        // HIGH-THROUGHPUT: Uses rpc_batch() to send all probes in a single
+        // curl invocation, drastically reducing popen/fork overhead.
+        // Falls back to individual rpc() calls if batching is unsupported.
         // ================================================================
         {
+            // ── Batch 1: Core info methods (6 calls → 1 curl invocation) ──
+            std::vector<BatchEntry> core_batch = {
+                {"getnetworkinfo",    "[]"},   // idx 0
+                {"help",              "[]"},   // idx 1
+                {"getblockchaininfo", "[]"},   // idx 2
+                {"getmemoryinfo",     "[]"},   // idx 3
+                {"logging",           "[]"},   // idx 4
+                {"getmempoolinfo",    "[]"},   // idx 5
+            };
+            if (have_wallet) {
+                core_batch.push_back({"getwalletinfo", "[]"});  // idx 6
+            }
+
+            auto core_results = rpc_batch(inst, core_batch, 30);
+
+            // Unpack results with the same variable names for downstream code
+            auto& ni       = core_results[0];
+            auto& help_all = core_results[1];
+            auto& bci      = core_results[2];
+            auto& mi       = core_results[3];
+            auto& log_r    = core_results[4];
+            auto& mpi      = core_results[5];
+
             // Probe 1: Internal version number (differs between ALL versions)
-            auto ni = rpc(inst, "getnetworkinfo");
             std::string internal_ver = jx(ni.output, "version");
             int iv = 0; try { iv = std::stoi(internal_ver); } catch(...) {}
-            
+
             // Probe 2: Count total RPC methods — differs per version
-            auto help_all = rpc(inst, "help");
             int rpc_method_count = 0;
             if (help_all.success) {
                 size_t pp = 0;
                 while ((pp = help_all.output.find("\n", pp)) != std::string::npos) { rpc_method_count++; pp++; }
             }
-            // Emit a finding with severity based on method count bucket
-            // This naturally differentiates even patch versions (e.g., 0.17.1 has 
-            // 125 methods, 0.17.2 might have 126 due to a backported RPC)
             all.push_back(make_finding(inst.version_string, "rpc",
                 "RPC-METHOD-COUNT-" + std::to_string(rpc_method_count),
                 "RPC methods: " + std::to_string(rpc_method_count) + " (ver=" + internal_ver + ")",
                 "methods=" + std::to_string(rpc_method_count), 1));
-            
+
             // Probe 3: Binary file size — ALWAYS differs between builds
             struct stat bin_st{};
             if (stat(inst.binary_path.c_str(), &bin_st) == 0) {
                 int64_t size_kb = bin_st.st_size / 1024;
-                int size_bucket = (int)(size_kb / 100); // 100KB buckets — finer granularity
+                int size_bucket = (int)(size_kb / 100);
                 all.push_back(make_finding(inst.version_string, "static_analysis",
                     "SA-BINARY-SIZE-" + std::to_string(size_kb),
                     "Binary: " + std::to_string(size_kb) + "KB (" + std::to_string(bin_st.st_size) + " bytes)",
                     "bytes=" + std::to_string(bin_st.st_size), 1));
             }
-            
+
             // Probe 4: getblockchaininfo response size — differs per softfork set
-            auto bci = rpc(inst, "getblockchaininfo");
             if (bci.success) {
                 int resp_bucket = (int)(bci.output.size() / 100);
-                // Count softfork entries
                 int sf_count = 0;
                 size_t pp = 0;
                 while ((pp = bci.output.find("\"status\"", pp)) != std::string::npos) { sf_count++; pp++; }
@@ -48177,9 +48362,8 @@ public:
                     "Softfork entries: " + std::to_string(sf_count) + " (response " + std::to_string(bci.output.size()) + " bytes)",
                     "sf_count=" + std::to_string(sf_count) + " resp_size=" + std::to_string(bci.output.size()), 1));
             }
-            
+
             // Probe 5: getmemoryinfo structure — varies across versions
-            auto mi = rpc(inst, "getmemoryinfo");
             if (mi.success) {
                 bool has_locked = mi.output.find("\"locked\"") != std::string::npos;
                 bool has_used = mi.output.find("\"used\"") != std::string::npos;
@@ -48191,9 +48375,8 @@ public:
                     "getmemoryinfo fields: " + std::to_string(mem_fields) + " of 4 present",
                     "locked=" + std::string(has_locked?"Y":"N") + " used=" + std::string(has_used?"Y":"N"), 1));
             }
-            
+
             // Probe 6: logging categories — differ per version
-            auto log_r = rpc(inst, "logging");
             if (log_r.success && !log_r.is_error()) {
                 int categories = 0;
                 size_t pp = 0;
@@ -48204,8 +48387,8 @@ public:
                     "Logging categories: " + std::to_string(categories),
                     "categories=" + std::to_string(categories), 1));
             }
-            
-            // Probe 7: Specific RPC availability (each appears in different versions)
+
+            // ── Batch 2: Feature-specific help probes (12 calls → 1 curl) ──
             struct RPCFeature { std::string method; std::string finding; };
             std::vector<RPCFeature> features = {
                 {"getindexinfo", "RPC-FEAT-INDEXINFO"},
@@ -48221,17 +48404,22 @@ public:
                 {"getprioritisedtransactions", "RPC-FEAT-PRIORITISED"},
                 {"submitpackage", "DS-FEAT-SUBMITPACKAGE"},
             };
-            for (auto& f : features) {
-                auto h = rpc(inst, "help", f.method);
+            std::vector<BatchEntry> feat_batch;
+            feat_batch.reserve(features.size());
+            for (const auto& f : features) {
+                feat_batch.push_back({"help", "[\"" + f.method + "\"]"});
+            }
+            auto feat_results = rpc_batch(inst, feat_batch, 30);
+            for (size_t fi = 0; fi < features.size(); ++fi) {
+                const auto& h = feat_results[fi];
                 if (h.success && h.output.find("not found") == std::string::npos &&
                     h.output.find("unknown") == std::string::npos && h.output.size() > 30) {
-                    all.push_back(make_finding(inst.version_string, "rpc", f.finding,
-                        f.method + " available", "ver=" + inst.version_string, 1));
+                    all.push_back(make_finding(inst.version_string, "rpc", features[fi].finding,
+                        features[fi].method + " available", "ver=" + inst.version_string, 1));
                 }
             }
-            
+
             // Probe 8: getmempoolinfo fields (fullrbf, unbroadcastcount, etc.)
-            auto mpi = rpc(inst, "getmempoolinfo");
             if (mpi.success) {
                 struct Field { std::string name; std::string finding; };
                 std::vector<Field> mp_fields = {
@@ -48249,10 +48437,10 @@ public:
                     }
                 }
             }
-            
-            // Probe 9: getwalletinfo fields
-            if (have_wallet) {
-                auto wi = rpc(inst, "getwalletinfo");
+
+            // Probe 9: getwalletinfo fields (from batch 1, idx 6)
+            if (have_wallet && core_results.size() > 6) {
+                auto& wi = core_results[6];
                 if (wi.success) {
                     struct Field { std::string name; std::string finding; };
                     std::vector<Field> wal_fields = {
@@ -48273,8 +48461,8 @@ public:
                     }
                 }
             }
-            
-            // Probe 10: getnetworkinfo fields
+
+            // Probe 10: getnetworkinfo fields (from batch 1, idx 0)
             if (ni.success) {
                 struct Field { std::string name; std::string finding; };
                 std::vector<Field> net_fields = {
@@ -62153,6 +62341,10 @@ public:
         dyn_cfg.per_version_timeout_seconds = config_.timeout_per_version;
         dyn_cfg.osx_archive_directory = config_.osx_dir;
         dyn_cfg.dry_run = config_.dry_run;
+        dyn_cfg.high_throughput = config_.high_throughput;
+        dyn_cfg.ht_rpcthreads = config_.ht_rpcthreads;
+        dyn_cfg.ht_rpcworkqueue = config_.ht_rpcworkqueue;
+        dyn_cfg.ht_rpcservertimeout = config_.ht_rpcservertimeout;
 
         VersionInstanceManager instance_mgr(dyn_cfg);
         auto versions = instance_mgr.get_versions_to_test();
@@ -64360,6 +64552,10 @@ public:
         dyn_cfg.per_version_timeout_seconds = config_.timeout_per_version;
         dyn_cfg.osx_archive_directory = config_.osx_dir;
         dyn_cfg.dry_run = config_.dry_run;
+        dyn_cfg.high_throughput = config_.high_throughput;
+        dyn_cfg.ht_rpcthreads = config_.ht_rpcthreads;
+        dyn_cfg.ht_rpcworkqueue = config_.ht_rpcworkqueue;
+        dyn_cfg.ht_rpcservertimeout = config_.ht_rpcservertimeout;
 
         VersionInstanceManager inst_mgr(dyn_cfg);
         auto versions = inst_mgr.get_versions_to_test();
@@ -65346,6 +65542,11 @@ CONFIGURATION:
   --audit-osx-dir=DIR  Path to osx/ archive directory
   --audit-dry-run      Validate config and print plan without executing
   --dry-run            Same as --audit-dry-run
+  --high-throughput    Launch bitcoind with high-capacity RPC settings
+                       (auto-enabled by --audit-deep)
+  --ht-rpcthreads=N    RPC threads for high-throughput mode (default: 64)
+  --ht-rpcworkqueue=N  RPC work queue depth (default: 512)
+  --ht-rpcservertimeout=N  RPC server timeout in seconds (default: 120)
 
 OUTPUT:
   --help, -h           Show this help message
