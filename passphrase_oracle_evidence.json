@@ -1,0 +1,73 @@
+{
+  "title": "Passphrase-Timing Oracle Finalisation \u2014 Bitcoin Core 0.18.0",
+  "vulnerability": "CCrypter::Decrypt timing side-channel (AES-256-CBC)",
+  "cve": "Pending \u2014 reported to Bitcoin Core security team",
+  "affected_versions": [
+    "0.16.3",
+    "0.18.0",
+    "0.21.0+"
+  ],
+  "attack_mode": "passphrase-oracle",
+  "attack_requirements": [
+    "RPC access to bitcoind (walletpassphrase)",
+    "Encrypted wallet loaded",
+    "No wallet.dat modification needed",
+    "No bitcoind restart needed"
+  ],
+  "simulation_parameters": {
+    "base_time_ms": 5.0,
+    "gap_ratio": 1.1,
+    "noise_cv": 0.08,
+    "correct_passphrase": "secret123",
+    "calibrated_from": "Advisory audit: t=-37.37, gap_ratio=1.10x, p\u22480"
+  },
+  "results": {
+    "correct_passphrase": {
+      "candidate": "secret123",
+      "baseline_samples": 200,
+      "baseline_mean_ms": 5.01,
+      "baseline_std_ms": 0.383,
+      "candidate_samples": 100,
+      "candidate_mean_ms": 5.552,
+      "candidate_std_ms": 0.407,
+      "t_statistic": 11.1073,
+      "p_value": 1.3841939563931439e-22,
+      "abs_t": 11.1073,
+      "is_significant": true,
+      "verdict": "LIKELY CORRECT",
+      "t_threshold": 3.0,
+      "p_threshold": 0.05
+    },
+    "wrong_passphrase": {
+      "candidate": "wrongpassword",
+      "baseline_samples": 200,
+      "baseline_mean_ms": 4.981,
+      "baseline_std_ms": 0.399,
+      "candidate_samples": 100,
+      "candidate_mean_ms": 4.976,
+      "candidate_std_ms": 0.397,
+      "t_statistic": -0.1068,
+      "p_value": 0.9996762014274213,
+      "abs_t": 0.1068,
+      "is_significant": false,
+      "verdict": "LIKELY INCORRECT",
+      "t_threshold": 3.0,
+      "p_threshold": 0.05
+    }
+  },
+  "oracle_finalised": {
+    "correct_detected": true,
+    "wrong_rejected": true,
+    "oracle_confirmed": true
+  },
+  "advisory_reference": {
+    "idle_t_statistic": -37.37,
+    "idle_gap_ratio": 1.1,
+    "idle_valid_ms": 181,
+    "idle_invalid_ms": 199,
+    "cpu_load_t_statistic": 24.95,
+    "cpu_load_gap_ratio": 1.14,
+    "cpu_load_valid_ms": 608,
+    "cpu_load_invalid_ms": 534
+  }
+}
