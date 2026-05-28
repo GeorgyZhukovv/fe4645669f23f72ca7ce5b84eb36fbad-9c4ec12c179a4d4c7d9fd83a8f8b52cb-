@@ -59237,11 +59237,11 @@ public:
                 rpc_fast(inst, "stop");
                 std::this_thread::sleep_for(std::chrono::seconds(3));
                 // Kill if still running
-                if (inst.pid > 0) {
-                    kill(inst.pid, SIGTERM);
+                if (inst.bitcoind_pid > 0) {
+                    kill(inst.bitcoind_pid, SIGTERM);
                     std::this_thread::sleep_for(std::chrono::seconds(2));
-                    kill(inst.pid, SIGKILL);
-                    waitpid(inst.pid, nullptr, WNOHANG);
+                    kill(inst.bitcoind_pid, SIGKILL);
+                    waitpid(inst.bitcoind_pid, nullptr, WNOHANG);
                 }
                 // Restart
                 std::string cmd = inst.binary_path +
