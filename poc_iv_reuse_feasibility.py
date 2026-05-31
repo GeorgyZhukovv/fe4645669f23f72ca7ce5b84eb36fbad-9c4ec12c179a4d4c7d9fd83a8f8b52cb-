@@ -1292,6 +1292,12 @@ def main():
         '-v', '--verbose', action='store_true',
         help='Enable detailed output',
     )
+    parser.add_argument(
+        '--sliding-window', action='store_true',
+        help='Run aggressive overlapping-window collision scan before '
+             'standard tests.  Slides a 16-byte window one byte at a time '
+             'to find collisions that the aligned scan misses.',
+    )
 
     args = parser.parse_args()
 
@@ -1299,13 +1305,61 @@ def main():
         print(f'  [!] Wallet file not found: {args.wallet}')
         sys.exit(1)
 
-    run_feasibility_assessment(
+    # ── Optional: sliding-window pre-scan ──
+    if args.sliding_window:
+        try:
+            from poc_sliding_window_feasibility import (
+                run_sliding_window_analysis,
+                scan_sliding_window,
+            )
+            print(f'\n  {"═" * 60}')
+            print(f'  SLIDING-WINDOW PRE-SCAN (aggressive overlapping)')
+            print(f'  {"═" * 60}')
+            sliding_result = run_sliding_window_analysis(
+                wallet_path=args.wallet,
+                output_json=None,  # will be merged into main report
+                verbose=args.verbose,
+            )
+            # Store for potential inclusion in the main JSON report
+        except ImportError:
+            print(f'  [!] poc_sliding_window_feasibility.py not found.')
+            print(f'      Skipping sliding-window scan.')
+            sliding_result = None
+        except Exception as e:
+            print(f'  [!] Sliding-window scan failed: {e}')
+            sliding_result = None
+    else:
+        sliding_result = None
+
+    result = run_feasibility_assessment(
         wallet_path=args.wallet,
         report_path=args.report,
         brute_force_bits=args.brute_force_bits,
         output_json=args.output_json,
         verbose=args.verbose,
     )
+
+    # ── Merge sliding-window results into JSON report if both exist ──
+    if sliding_result and args.output_json:
+        output_path = args.output_json
+        if output_path is True or output_path == '':
+            output_path = 'feasibility_report.json'
+        try:
+            with open(output_path, 'r') as f:
+                report_data = json.load(f)
+            report_data['sliding_window_analysis'] = {
+                'aligned_scan': sliding_result.get('aligned_scan'),
+                'sliding_window_scan': sliding_result.get('sliding_window_scan'),
+                'cross_reference': sliding_result.get('cross_reference'),
+                'collision_diff': sliding_result.get('collision_diff'),
+                'feasibility_tests': sliding_result.get('feasibility_tests'),
+                'overall': sliding_result.get('overall'),
+            }
+            with open(output_path, 'w') as f:
+                json.dump(report_data, f, indent=2, default=str)
+            print(f'\n  [*] Sliding-window results merged into: {output_path}')
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
