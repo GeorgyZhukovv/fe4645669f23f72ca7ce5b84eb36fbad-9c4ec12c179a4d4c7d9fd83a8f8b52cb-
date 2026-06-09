@@ -55685,85 +55685,38 @@ public:
         }
 
         // ================================================================
-        // NOVEL METHOD – not based on existing public research
-        // KL-NOVEL-RPC-TIMING-ENTROPY: Timing distribution analysis for
-        // key-related vs non-key RPCs.
-        // Full statistical depth restored: 50×6 samples for robust entropy comparison
+        // KL-NOVEL-RPC-TIMING-ENTROPY — MARKED FALSE-POSITIVE, DISABLED
+        // ================================================================
+        // REASON: This engine was found to produce false positives due to:
+        //   1. Non-latency-matched control RPCs (getblockcount vs getnewaddress
+        //      have fundamentally different baseline latencies, making KS/CV
+        //      comparisons fire on internal distribution spread, not key-path leakage).
+        //   2. Single entropy metric without cross-validation (no Welch t-test,
+        //      Mann-Whitney U, or CV-under-load consistency check).
+        //   3. Heterogeneous non-key RPC pool creating artefactual separation.
+        //   4. No concurrent-load consistency test; only one key RPC showed
+        //      marginal CV decrease under flood, which is insufficient.
+        // STATUS: FALSE-POSITIVE — disabled by default. Severity demoted to 0.
         // ================================================================
         {
-            auto sub_results = run_subtest("KL-NOVEL-RPC-TIMING-ENTROPY", 45, [&]() -> std::vector<DynamicFinding> {
+            auto sub_results = run_subtest("KL-NOVEL-RPC-TIMING-ENTROPY", 1, [&]() -> std::vector<DynamicFinding> {
                 std::vector<DynamicFinding> sub;
-                EnhancedStructuredLogger::instance()->log(LogLevel::INFO, "engine_kl",
-                    ver + ": KL-NOVEL-RPC-TIMING-ENTROPY — timing distribution analysis");
-
-                std::vector<double> key_rpc_times;
-                std::vector<double> nonkey_rpc_times;
-                std::vector<std::string> key_rpcs = {"getnewaddress", "getwalletinfo", "listunspent"};
-                std::vector<std::string> nonkey_rpcs = {"getblockcount", "getblockchaininfo", "getmempoolinfo"};
-
-                auto measure_rpc = [&](const std::string& method) -> double {
-                    auto t0 = std::chrono::steady_clock::now();
-                    rpc_fast(inst, method, "[]");
-                    auto t1 = std::chrono::steady_clock::now();
-                    return std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-                };
-
-                constexpr int RPC_TIMING_SAMPLES = 50;
-                for (int i = 0; i < RPC_TIMING_SAMPLES; i++) {
-                    if (kl_cancel_flag->load()) break;
-                    for (const auto& m : key_rpcs)
-                        key_rpc_times.push_back(measure_rpc(m));
-                    for (const auto& m : nonkey_rpcs)
-                        nonkey_rpc_times.push_back(measure_rpc(m));
-                }
-
-                auto shannon_entropy = [](const std::vector<double>& v, int bins) -> double {
-                    if (v.empty()) return 0.0;
-                    double mn = *std::min_element(v.begin(), v.end());
-                    double mx = *std::max_element(v.begin(), v.end());
-                    if (mx <= mn) return 0.0;
-                    std::vector<int> h(bins, 0);
-                    for (auto x : v) {
-                        int b = std::min((int)((x - mn) / (mx - mn) * bins), bins - 1);
-                        h[b]++;
-                    }
-                    double e = 0.0;
-                    for (int c : h) {
-                        if (c > 0) { double p = (double)c / v.size(); e -= p * std::log2(p); }
-                    }
-                    return e;
-                };
-
-                double key_entropy = shannon_entropy(key_rpc_times, 20);
-                double nonkey_entropy = shannon_entropy(nonkey_rpc_times, 20);
-                double entropy_diff = std::abs(key_entropy - nonkey_entropy);
-
-                auto stats = [](const std::vector<double>& v) -> std::pair<double, double> {
-                    double sum = 0; for (auto x : v) sum += x;
-                    double mean = sum / v.size();
-                    double sq_sum = 0; for (auto x : v) sq_sum += (x - mean) * (x - mean);
-                    return {mean, std::sqrt(sq_sum / v.size())};
-                };
-                auto [key_mean, key_std] = stats(key_rpc_times);
-                auto [nonkey_mean, nonkey_std] = stats(nonkey_rpc_times);
-
-                bool timing_anomaly = entropy_diff > 1.5 || (key_std / (key_mean + 1e-9)) > 2.0 * (nonkey_std / (nonkey_mean + 1e-9));
-
+                EnhancedStructuredLogger::instance()->log(LogLevel::WARNING, "engine_kl",
+                    ver + ": KL-NOVEL-RPC-TIMING-ENTROPY — DISABLED (FALSE-POSITIVE). "
+                    "Engine demoted: non-latency-matched controls, single-metric entropy, "
+                    "heterogeneous pool, no CV-under-load validation. "
+                    "Use KL-ROBUST-SINGLE-RPC-TIMING-ORACLE for hardened replacement.");
+                // Emit a severity-0 informational record so the finding appears in
+                // the report with its FALSE-POSITIVE classification clearly stated.
                 sub.push_back(make_finding(ver, "key_leakage",
-                    timing_anomaly ? "KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY" : "KL-NOVEL-RPC-TIMING-ENTROPY-OK",
-                    timing_anomaly ?
-                    "ANOMALY: Key-related RPCs show distinct timing entropy (key_ent=" +
-                    std::to_string(key_entropy) + " nonkey_ent=" + std::to_string(nonkey_entropy) +
-                    " diff=" + std::to_string(entropy_diff) + ")" :
-                    "PASS: Key and non-key RPC timing distributions are similar (diff=" +
-                    std::to_string(entropy_diff) + ")",
-                    "key_entropy=" + std::to_string(key_entropy) +
-                    " nonkey_entropy=" + std::to_string(nonkey_entropy) +
-                    " key_mean_ns=" + std::to_string(key_mean) +
-                    " nonkey_mean_ns=" + std::to_string(nonkey_mean) +
-                    " key_cv=" + std::to_string(key_std / (key_mean + 1e-9)) +
-                    " nonkey_cv=" + std::to_string(nonkey_std / (nonkey_mean + 1e-9)),
-                    timing_anomaly ? 6 : 0));
+                    "KL-NOVEL-RPC-TIMING-ENTROPY-FALSE-POSITIVE",
+                    "FALSE-POSITIVE: Engine disabled. Root cause: non-latency-matched "
+                    "control group, single entropy metric, heterogeneous RPC pool, "
+                    "no CV-under-load consistency test. "
+                    "Replaced by KL-ROBUST-SINGLE-RPC-TIMING-ORACLE (Section 96).",
+                    "classification=FALSE_POSITIVE severity=0 disabled=true "
+                    "replacement=KL-ROBUST-SINGLE-RPC-TIMING-ORACLE",
+                    0));
                 return sub;
             });
             results.insert(results.end(), sub_results.begin(), sub_results.end());
