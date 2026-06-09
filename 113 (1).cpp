@@ -55747,23 +55747,38 @@ public:
                 auto [key_mean, key_std] = stats(key_rpc_times);
                 auto [nonkey_mean, nonkey_std] = stats(nonkey_rpc_times);
 
-                bool timing_anomaly = entropy_diff > 1.5 || (key_std / (key_mean + 1e-9)) > 2.0 * (nonkey_std / (nonkey_mean + 1e-9));
+                // ============================================================
+                // FALSE-POSITIVE GATE: KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY
+                // This finding was debunked. The original single-metric test
+                // (Shannon entropy + CV ratio) fires on internal distribution
+                // spread caused by pooling heterogeneous non-key RPCs without
+                // latency matching. Disabled by default; always emits severity 0.
+                // ============================================================
+                bool timing_anomaly = false; // DISABLED — proven false positive
 
                 sub.push_back(make_finding(ver, "key_leakage",
-                    timing_anomaly ? "KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY" : "KL-NOVEL-RPC-TIMING-ENTROPY-OK",
-                    timing_anomaly ?
-                    "ANOMALY: Key-related RPCs show distinct timing entropy (key_ent=" +
-                    std::to_string(key_entropy) + " nonkey_ent=" + std::to_string(nonkey_entropy) +
-                    " diff=" + std::to_string(entropy_diff) + ")" :
-                    "PASS: Key and non-key RPC timing distributions are similar (diff=" +
-                    std::to_string(entropy_diff) + ")",
+                    "KL-NOVEL-RPC-TIMING-ENTROPY-FALSE-POSITIVE",
+                    "FALSE-POSITIVE (DISABLED): KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY "
+                    "has been debunked. Root causes: (1) non-latency-matched control "
+                    "RPCs making KS test fire on internal distribution spread, "
+                    "(2) reliance on single entropy metric without cross-validation "
+                    "(Welch t-test, Mann-Whitney U, CV-under-load), (3) pooling "
+                    "heterogeneous non-key RPCs creating artefactual separation, "
+                    "(4) no concurrent-load consistency test. "
+                    "Original metrics preserved for audit trail: "
+                    "key_entropy=" + std::to_string(key_entropy) +
+                    " nonkey_entropy=" + std::to_string(nonkey_entropy) +
+                    " diff=" + std::to_string(entropy_diff) +
+                    " key_cv=" + std::to_string(key_std / (key_mean + 1e-9)) +
+                    " nonkey_cv=" + std::to_string(nonkey_std / (nonkey_mean + 1e-9)),
+                    "DISABLED_ENGINE=KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY "
                     "key_entropy=" + std::to_string(key_entropy) +
                     " nonkey_entropy=" + std::to_string(nonkey_entropy) +
                     " key_mean_ns=" + std::to_string(key_mean) +
                     " nonkey_mean_ns=" + std::to_string(nonkey_mean) +
                     " key_cv=" + std::to_string(key_std / (key_mean + 1e-9)) +
                     " nonkey_cv=" + std::to_string(nonkey_std / (nonkey_mean + 1e-9)),
-                    timing_anomaly ? 6 : 0));
+                    0)); // severity 0 — false positive, disabled
                 return sub;
             });
             results.insert(results.end(), sub_results.begin(), sub_results.end());
