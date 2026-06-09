@@ -55770,23 +55770,33 @@ public:
                 auto [key_mean, key_std] = stats(key_rpc_times);
                 auto [nonkey_mean, nonkey_std] = stats(nonkey_rpc_times);
 
-                bool timing_anomaly = entropy_diff > 1.5 || (key_std / (key_mean + 1e-9)) > 2.0 * (nonkey_std / (nonkey_mean + 1e-9));
+                // DISABLED: KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY marked FALSE-POSITIVE.
+                // Root cause: non-latency-matched control RPCs, single entropy metric
+                // without cross-validation (Welch t-test, Mann-Whitney U, CV-under-load),
+                // pooling heterogeneous non-key RPCs creating artefactual separation,
+                // and no concurrent-load consistency test. See Part B hardening notes.
+                bool timing_anomaly = false; // FORCED FALSE — original heuristic disabled
+                // Original condition was:
+                // entropy_diff > 1.5 || (key_std / (key_mean + 1e-9)) > 2.0 * (nonkey_std / (nonkey_mean + 1e-9))
+                // This produced false positives due to systemic methodology flaws.
 
                 sub.push_back(make_finding(ver, "key_leakage",
-                    timing_anomaly ? "KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY" : "KL-NOVEL-RPC-TIMING-ENTROPY-OK",
-                    timing_anomaly ?
-                    "ANOMALY: Key-related RPCs show distinct timing entropy (key_ent=" +
-                    std::to_string(key_entropy) + " nonkey_ent=" + std::to_string(nonkey_entropy) +
-                    " diff=" + std::to_string(entropy_diff) + ")" :
-                    "PASS: Key and non-key RPC timing distributions are similar (diff=" +
-                    std::to_string(entropy_diff) + ")",
+                    "KL-NOVEL-RPC-TIMING-ENTROPY-FALSE-POSITIVE",
+                    "FALSE-POSITIVE (DISABLED): KL-NOVEL-RPC-TIMING-ENTROPY-ANOMALY has been "
+                    "marked as a false positive and disabled by default. The original detection "
+                    "relied on non-latency-matched control RPCs, a single entropy metric without "
+                    "cross-validation, pooled heterogeneous non-key RPCs, and lacked concurrent-load "
+                    "consistency testing. entropy_diff=" + std::to_string(entropy_diff) +
+                    " key_entropy=" + std::to_string(key_entropy) +
+                    " nonkey_entropy=" + std::to_string(nonkey_entropy),
                     "key_entropy=" + std::to_string(key_entropy) +
                     " nonkey_entropy=" + std::to_string(nonkey_entropy) +
                     " key_mean_ns=" + std::to_string(key_mean) +
                     " nonkey_mean_ns=" + std::to_string(nonkey_mean) +
                     " key_cv=" + std::to_string(key_std / (key_mean + 1e-9)) +
-                    " nonkey_cv=" + std::to_string(nonkey_std / (nonkey_mean + 1e-9)),
-                    timing_anomaly ? 6 : 0));
+                    " nonkey_cv=" + std::to_string(nonkey_std / (nonkey_mean + 1e-9)) +
+                    " STATUS=FALSE_POSITIVE DISABLED=true",
+                    0)); // severity 0 = disabled
                 return sub;
             });
             results.insert(results.end(), sub_results.begin(), sub_results.end());
