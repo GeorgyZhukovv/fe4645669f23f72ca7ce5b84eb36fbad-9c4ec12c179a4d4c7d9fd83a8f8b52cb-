@@ -1,0 +1,33 @@
+# Example project-local agent configuration. Copy to .agent.toml and edit.
+
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+fallback_provider = "openai"
+fallback_model = "gpt-4o-mini"
+temperature = 0.2
+max_output_tokens = 4096
+
+[budget]
+session_token_limit = 1_000_000
+context_token_limit = 180_000
+
+[tools]
+default_timeout = 60
+bash_timeout = 120
+allow_destructive_commands = false
+
+[memory]
+working_dir = ".agent_state"
+semantic_collection = "agent_default"
+episodic_db = "episodic.sqlite"
+working_ttl_seconds = 0
+
+[ui]
+refresh_per_second = 10
+show_memory_panel = true
+show_dag_panel = true
+
+[safety]
+require_confirm_for_high_risk = true
+hypothetical_sandbox = true
