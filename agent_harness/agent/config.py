@@ -78,6 +78,40 @@ class SafetyConfig(BaseModel):
     max_step_limit: int = 40
 
 
+class SandboxConfigModel(BaseModel):
+    """Sandbox backend selection + per-backend tuning."""
+
+    backend: str = "auto"
+    image: str | None = None
+    cpu_quota: float = 1.0
+    memory_limit: str = "2g"
+    pids_limit: int = 256
+    network_mode: str = "bridge"
+    read_only_root: bool = False
+
+
+class SwarmConfig(BaseModel):
+    """Multi-agent swarm options."""
+
+    enabled: bool = False
+    max_parallel: int = 4
+    file_lock_timeout: int = 30
+
+
+class ObservabilityConfig(BaseModel):
+    """Observability / telemetry options."""
+
+    events_jsonl: bool = True
+    otlp_endpoint: str | None = None
+    service_name: str = "agent-harness"
+
+
+class PersonaConfig(BaseModel):
+    """Active persona id and per-persona overrides."""
+
+    active: str = "default"
+
+
 class AgentConfig(BaseSettings):
     """Top-level agent configuration aggregating every subsection."""
 
@@ -93,6 +127,11 @@ class AgentConfig(BaseSettings):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
+    sandbox: SandboxConfigModel = Field(default_factory=SandboxConfigModel)
+    swarm: SwarmConfig = Field(default_factory=SwarmConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    persona: PersonaConfig = Field(default_factory=PersonaConfig)
+    personas: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:

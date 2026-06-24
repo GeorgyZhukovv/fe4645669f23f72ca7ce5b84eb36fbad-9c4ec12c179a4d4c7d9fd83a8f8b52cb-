@@ -1,7 +1,7 @@
 """Built-in tools and registry for the agent harness."""
 
 from agent.tools.registry import GLOBAL_REGISTRY, ToolRegistry, ToolSpec
-from agent.tools import bash, code, files, git, search, web  # noqa: F401 - side-effect: registration
+from agent.tools import bash, code, deps, files, git, indexer, lsp, multi_edit, search, vcs_hosting, web  # noqa: F401 - side-effect: registration
 
 
 def default_registry() -> ToolRegistry:

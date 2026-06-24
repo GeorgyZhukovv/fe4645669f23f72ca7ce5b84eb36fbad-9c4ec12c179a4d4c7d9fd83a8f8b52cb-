@@ -108,6 +108,7 @@ class Orchestrator:
         self.session: Session | None = None
         self.context: ContextManager | None = None
         self.audit: AuditLog | None = None
+        self.events = None  # populated on run() start
         self._notes: list[str] = []
 
     def _build_llm(self) -> LLMClient:
@@ -361,6 +362,11 @@ class Orchestrator:
         self.registry.set_audit(self.audit)
         self.context.working.set_compression_callback(self._compress_messages)
 
+        from agent.observability.events import EventSink
+
+        self.events = EventSink(self._state_dir() / "events" / f"{session_id}.jsonl")
+        self.events.helper("session_started", objective=objective, session_id=session_id)
+
         if self.ui is not None and hasattr(self.ui, "set_session"):
             self.ui.set_session(self.session)
 
@@ -438,6 +444,8 @@ class Orchestrator:
         if self.ui is not None and hasattr(self.ui, "refresh_dag"):
             self.ui.refresh_dag()
         self.audit.append("task_start", {"id": task.id, "description": task.description})
+        if self.events is not None:
+            self.events.helper("task_started", task_id=task.id, description=task.description, role="EXECUTOR")
         loop = AgentLoop(
             llm=self.llm,
             tools=self.registry,
@@ -508,6 +516,16 @@ class Orchestrator:
                 "artifacts": loop_result.artifacts,
             },
         )
+        if self.events is not None:
+            evt = "task_completed" if task.status == TaskStatus.COMPLETE else "task_failed"
+            self.events.helper(
+                evt,
+                task_id=task.id,
+                summary=task.summary or "",
+                error=task.error or "",
+                artifacts=loop_result.artifacts,
+                steps=loop_result.steps,
+            )
         if self.ui is not None and hasattr(self.ui, "refresh_dag"):
             self.ui.refresh_dag()
 
@@ -614,6 +632,8 @@ class Orchestrator:
             self.session.outcome = "incomplete"
         self.save_session()
         self.audit.append("session_end", {"outcome": self.session.outcome, "cost": self.cost.summary()})
+        if self.events is not None:
+            self.events.helper("session_ended", outcome=self.session.outcome, cost=self.cost.summary())
 
     async def _generate_documentation(self) -> None:
         """Auto-generate CHANGES.md describing modifications in the session."""

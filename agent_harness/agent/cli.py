@@ -68,13 +68,37 @@ def main(ctx: click.Context, config_file: Path | None) -> None:
     ctx.obj["config"] = load_config(overrides=overrides)
 
 
-@main.command(help='Run the agent on a new objective.')
+@main.command(help='Run the agent on a new objective. Supports @symbol and @path/to/file mentions.')
 @click.argument("objective", nargs=-1, required=True)
 @click.option("--no-ui", is_flag=True, help="Disable the rich terminal UI.")
+@click.option("--persona", default=None, help="Persona name (default | strict | fast | security | minimal | architect).")
 @click.pass_context
-def run(ctx: click.Context, objective: tuple[str, ...], no_ui: bool) -> None:
+def run(ctx: click.Context, objective: tuple[str, ...], no_ui: bool, persona: str | None) -> None:
     config: AgentConfig = ctx.obj["config"]
     obj_str = " ".join(objective)
+
+    # Resolve any @mentions in the objective via the indexer.
+    try:
+        from agent.tools.indexer import resolve_mentions
+
+        resolved = resolve_mentions(obj_str)
+    except Exception:
+        resolved = []
+    if resolved:
+        ctx_block = "\n".join(
+            f"- @{r['mention']}: {json.dumps({k: v for k, v in r.items() if k != 'mention'})[:400]}"
+            for r in resolved
+        )
+        obj_str = f"{obj_str}\n\nMention context:\n{ctx_block}"
+
+    if persona:
+        from agent.prompts.manager import PromptManager
+
+        p = PromptManager().persona(persona)
+        config.llm.temperature = p.temperature
+        config.llm.max_output_tokens = p.max_tokens
+        config.persona.active = persona
+
     orch, ui = _build_orchestrator(config, with_ui=not no_ui)
 
     async def go() -> None:
@@ -177,8 +201,9 @@ def memory_search(ctx: click.Context, query: str, top: int) -> None:
 
 
 @main.command(help="Show cost and token breakdown for the most recent session.")
+@click.option("--dashboard", is_flag=True, help="Render the live cost dashboard.")
 @click.pass_context
-def cost(ctx: click.Context) -> None:
+def cost(ctx: click.Context, dashboard: bool) -> None:
     config: AgentConfig = ctx.obj["config"]
     state_dir = Path(config.memory.working_dir).resolve() / "sessions"
     if not state_dir.exists():
@@ -189,8 +214,206 @@ def cost(ctx: click.Context) -> None:
         console.print("[grey50](no sessions yet)[/grey50]")
         return
     data = json.loads(files[0].read_text())
+    if dashboard:
+        from agent.observability.dashboard import render_cost_dashboard, historical_total
+        from agent.observability.events import EventSink
+
+        events_path = state_dir.parent / "events" / f"{data['id']}.jsonl"
+        events = EventSink(events_path).read_all() if events_path.exists() else []
+        render_cost_dashboard(events, console=console)
+        hist = historical_total(state_dir.parent / "events")
+        console.rule("[bold cyan]all-time")
+        console.print(f"Total cost across sessions: [bold green]${hist['total_cost']:.4f}[/bold green]")
+        console.print(f"Total tokens across sessions: [bold]{int(hist['total_tokens'])}[/bold]")
+        return
     summary = data.get("cost_summary") or {}
     console.print_json(json.dumps(summary, indent=2))
+
+
+@main.command(help="Replay a session by id from its event stream.")
+@click.argument("session_id")
+@click.option("--speed", default="1", help="Playback speed: 1, 2, 5, or 'instant'.")
+@click.option("--report", is_flag=True, help="Write session_report.md and exit.")
+@click.pass_context
+def replay(ctx: click.Context, session_id: str, speed: str, report: bool) -> None:
+    """Replay a previously recorded session."""
+    from agent.observability.events import EventSink
+    from agent.observability.replay import ReplayPlayer, render_session_report
+
+    config: AgentConfig = ctx.obj["config"]
+    events_path = Path(config.memory.working_dir).resolve() / "events" / f"{session_id}.jsonl"
+    if not events_path.exists():
+        console.print(f"[red]No event stream for session {session_id}[/red]")
+        return
+    events = EventSink(events_path).read_all()
+    if report:
+        md = render_session_report(events)
+        out = Path("session_report.md")
+        out.write_text(md)
+        console.print(f"[green]wrote {out}[/green]")
+        return
+    sp = 0.0 if speed == "instant" else float(speed)
+    player = ReplayPlayer(events, speed=sp if sp > 0 else 1.0, console=console)
+    asyncio.run(player.play())
+
+
+@main.group(help="GitHub / GitLab PR operations.")
+def pr() -> None:
+    """PR subcommands."""
+
+
+@pr.command("review", help="Review a PR: fetch diff and ask the agent to surface findings.")
+@click.argument("pr_number", type=int)
+@click.option("--repo", default="", help="owner/repo (default $GITHUB_REPOSITORY).")
+@click.pass_context
+def pr_review(ctx: click.Context, pr_number: int, repo: str) -> None:
+    config: AgentConfig = ctx.obj["config"]
+
+    async def go() -> None:
+        from agent.tools.vcs_hosting import _build_client, _default_repo
+
+        client = _build_client()
+        r = repo or _default_repo()
+        diff = await client.get_pr_diff(r, pr_number)
+        orch, _ui = _build_orchestrator(config, with_ui=False)
+        session = await orch.run(
+            f"Review PR #{pr_number} in {r}. Diff follows.\n\n{diff[:60_000]}"
+        )
+        console.print(f"[bold green]Review session {session.id} → {session.outcome}[/bold green]")
+
+    asyncio.run(go())
+
+
+@pr.command("fix", help="Fix unresolved review comments on a PR autonomously.")
+@click.argument("pr_number", type=int)
+@click.option("--repo", default="")
+@click.pass_context
+def pr_fix(ctx: click.Context, pr_number: int, repo: str) -> None:
+    config: AgentConfig = ctx.obj["config"]
+
+    async def go() -> None:
+        from agent.tools.vcs_hosting import _build_client, _default_repo
+
+        client = _build_client()
+        r = repo or _default_repo()
+        pr_obj = await client.get_pull_request(r, pr_number)
+        diff = await client.get_pr_diff(r, pr_number)
+        orch, _ui = _build_orchestrator(config, with_ui=False)
+        session = await orch.run(
+            f"Fix all review comments on PR #{pr_number} ({pr_obj.title}). "
+            f"Branch: {pr_obj.head_ref}. Diff:\n\n{diff[:30_000]}"
+        )
+        console.print(f"[bold green]Fix session {session.id} → {session.outcome}[/bold green]")
+
+    asyncio.run(go())
+
+
+@main.command("issue", help="Fetch an issue and implement it end-to-end.")
+@click.argument("issue_number", type=int)
+@click.option("--repo", default="")
+@click.pass_context
+def issue_impl(ctx: click.Context, issue_number: int, repo: str) -> None:
+    config: AgentConfig = ctx.obj["config"]
+
+    async def go() -> None:
+        from agent.tools.vcs_hosting import _build_client, _default_repo
+
+        client = _build_client()
+        r = repo or _default_repo()
+        issue = await client.get_issue(r, issue_number)
+        objective = (
+            f"Implement issue #{issue.number}: {issue.title}\n\n{issue.body[:6000]}"
+        )
+        orch, _ui = _build_orchestrator(config, with_ui=False)
+        session = await orch.run(objective)
+        console.print(f"[bold green]Issue session {session.id} → {session.outcome}[/bold green]")
+
+    asyncio.run(go())
+
+
+@main.group(help="CI helpers.")
+def ci() -> None:
+    """CI subcommands."""
+
+
+@ci.command("fix", help="Diagnose and autonomously fix failing CI checks on current branch.")
+@click.option("--commit", default="HEAD", help="Commit sha to inspect.")
+@click.option("--repo", default="")
+@click.pass_context
+def ci_fix(ctx: click.Context, commit: str, repo: str) -> None:
+    config: AgentConfig = ctx.obj["config"]
+
+    async def go() -> None:
+        import subprocess
+
+        from agent.tools.vcs_hosting import _build_client, _default_repo
+
+        client = _build_client()
+        r = repo or _default_repo()
+        sha = commit
+        if sha == "HEAD":
+            try:
+                sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+            except Exception:
+                pass
+        checks = await client.get_ci_status(r, sha)
+        failing = [c for c in checks if (c.conclusion or "").lower() in {"failure", "cancelled", "timed_out"}]
+        if not failing:
+            console.print("[green]No failing checks.[/green]")
+            return
+        details = "\n".join(f"- {c.name}: {c.details[:400]}" for c in failing)
+        orch, _ui = _build_orchestrator(config, with_ui=False)
+        await orch.run(f"Fix failing CI checks on commit {sha}:\n{details}")
+
+    asyncio.run(go())
+
+
+@main.group(help="Prompt management.")
+def prompt_cmd() -> None:
+    """Prompt subcommands."""
+
+
+@prompt_cmd.command("eval", help="A/B-compare prompt variants on the same objective.")
+@click.argument("objective", nargs=-1, required=True)
+@click.option("--variants", default="default,strict", help="Comma-separated persona names.")
+@click.pass_context
+def prompt_eval(ctx: click.Context, objective: tuple[str, ...], variants: str) -> None:
+    config: AgentConfig = ctx.obj["config"]
+    obj_str = " ".join(objective)
+
+    async def go() -> None:
+        from agent.prompts.manager import PromptManager
+
+        pm = PromptManager()
+        names = [v.strip() for v in variants.split(",") if v.strip()]
+        rows: list[dict[str, Any]] = []
+        for name in names:
+            persona = pm.persona(name)
+            orch, _ui = _build_orchestrator(config, with_ui=False)
+            orch.llm.cost_tracker = orch.cost
+            orch.config.llm.temperature = persona.temperature
+            orch.config.llm.max_output_tokens = persona.max_tokens
+            session = await orch.run(obj_str)
+            rows.append({
+                "persona": name,
+                "outcome": session.outcome,
+                "cost_usd": orch.cost.total_usd,
+                "prompt_tokens": orch.cost.total_prompt_tokens,
+                "completion_tokens": orch.cost.total_completion_tokens,
+                "tasks_complete": sum(1 for t in session.tasks.values() if t.status.value == "complete"),
+            })
+
+        tbl = Table(title="prompt eval results")
+        for col in ("persona", "outcome", "cost_usd", "prompt_tokens", "completion_tokens", "tasks_complete"):
+            tbl.add_column(col)
+        for r in rows:
+            tbl.add_row(
+                r["persona"], r["outcome"], f"${r['cost_usd']:.4f}",
+                str(r["prompt_tokens"]), str(r["completion_tokens"]), str(r["tasks_complete"]),
+            )
+        console.print(tbl)
+
+    asyncio.run(go())
 
 
 def cli_entry() -> None:

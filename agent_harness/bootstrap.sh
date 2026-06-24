@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command bootstrap: venv + install + test + demo.
+# One-command bootstrap: venv + install + smoke checks + test suite + optional demo.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +24,45 @@ pip install --upgrade pip >/dev/null
 
 echo "[bootstrap] installing agent_harness (editable, dev extras)"
 pip install -e ".[dev]"
+
+echo "[bootstrap] sanity: build the codebase index against this project"
+python -c "
+from agent.indexer import build_index, save_index
+idx = build_index('.')
+save_index(idx, '.')
+stats = idx.stats()
+print(f'  files indexed: {stats.total_files}, symbols: {stats.total_symbols}, languages: {sorted(stats.by_language.keys())}')
+"
+
+echo "[bootstrap] sanity: dependency scan against this project"
+python -c "
+import asyncio
+from agent.tools.deps import deps_vulns
+out = asyncio.run(deps_vulns('.'))
+print(f'  ecosystem={out[\"ecosystem\"]} scanned={out[\"total_packages_scanned\"]} critical={out[\"critical\"]}')
+"
+
+if command -v docker >/dev/null 2>&1; then
+    echo "[bootstrap] sanity: docker sandbox smoke test"
+    python -c "
+import asyncio
+from agent.sandbox import select_sandbox_backend, SandboxConfig
+async def go():
+    sb = select_sandbox_backend(SandboxConfig(backend='docker', image='alpine:3', network_mode='none'))
+    if sb.name != 'docker':
+        print('  docker backend not selected (skipped)')
+        return
+    try:
+        await sb.setup('.', SandboxConfig(backend='docker', image='alpine:3', network_mode='none'))
+        r = await sb.exec('echo sandbox-ok', timeout=10)
+        print(f'  docker exec → exit={r.exit_code} stdout={r.stdout.strip()!r}')
+    finally:
+        await sb.teardown()
+asyncio.run(go())
+" || echo "[bootstrap] docker smoke test failed (non-fatal)"
+else
+    echo "[bootstrap] docker not on PATH — skipping docker smoke test"
+fi
 
 echo "[bootstrap] running test suite"
 pytest -q

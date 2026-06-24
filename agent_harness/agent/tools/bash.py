@@ -39,10 +39,25 @@ def is_destructive(command: str) -> bool:
     return bool(DESTRUCTIVE_RE.search(command))
 
 
+_ACTIVE_SANDBOX = None  # type: ignore[var-annotated]
+
+
+def set_active_sandbox(sandbox) -> None:  # type: ignore[no-untyped-def]
+    """Install a :class:`agent.sandbox.base.SandboxBackend` for all ``bash_exec`` calls."""
+    global _ACTIVE_SANDBOX
+    _ACTIVE_SANDBOX = sandbox
+
+
+def get_active_sandbox():  # type: ignore[no-untyped-def]
+    """Return the currently installed sandbox (or ``None`` for direct subprocess)."""
+    return _ACTIVE_SANDBOX
+
+
 @GLOBAL_REGISTRY.tool(
     description=(
         "Execute a shell command in a subprocess and capture stdout, stderr, and exit code. "
-        "Supports a hard timeout (seconds). Use working_dir to set the CWD."
+        "Supports a hard timeout (seconds). Use working_dir to set the CWD. If a sandbox "
+        "backend is active for the session, execution is routed through it."
     ),
     side_effect="destructive",
     timeout=180.0,
@@ -53,13 +68,27 @@ async def bash_exec(command: str, timeout: int = 60, working_dir: str = ".") -> 
     Args:
         command: The shell command to execute. Will be run via ``/bin/sh -c``.
         timeout: Hard timeout in seconds.
-        working_dir: Working directory passed to the subprocess.
+        working_dir: Working directory passed to the subprocess (ignored when a
+            sandbox backend is active).
 
     Returns:
         A serialisable dict with ``exit_code``, ``stdout``, ``stderr``,
         ``duration_ms``, and ``timed_out``.
     """
     import time
+
+    if _ACTIVE_SANDBOX is not None:
+        res = await _ACTIVE_SANDBOX.exec(command, timeout=timeout)
+        return {
+            "command": res.command,
+            "exit_code": res.exit_code,
+            "stdout": res.stdout[-8000:],
+            "stderr": res.stderr[-4000:],
+            "duration_ms": res.duration_ms,
+            "timed_out": res.timed_out,
+            "destructive": is_destructive(command),
+            "backend": res.backend,
+        }
 
     cwd = os.path.abspath(working_dir or ".")
     start = time.perf_counter()
@@ -96,6 +125,7 @@ async def bash_exec(command: str, timeout: int = 60, working_dir: str = ".") -> 
         "duration_ms": result.duration_ms,
         "timed_out": result.timed_out,
         "destructive": result.is_destructive(),
+        "backend": "subprocess",
     }
 
 
