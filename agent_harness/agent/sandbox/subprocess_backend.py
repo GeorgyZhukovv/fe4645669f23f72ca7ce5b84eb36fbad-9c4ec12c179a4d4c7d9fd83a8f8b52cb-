@@ -7,6 +7,7 @@ import os
 import resource
 import shutil
 import signal
+import sys
 import time
 from pathlib import Path
 
@@ -47,7 +48,10 @@ class SubprocessSandbox(SandboxBackend):
                 resource.setrlimit(resource.RLIMIT_CPU, (int(timeout) + 5, int(timeout) + 5))
             except (ValueError, OSError):
                 pass
-            if cfg.pids_limit:
+            # RLIMIT_NPROC on macOS / Darwin counts processes per UID rather
+            # than per process group, so any low cap breaks the parent shell.
+            # Skip it there; Linux gets the intended per-pgroup behaviour.
+            if cfg.pids_limit and sys.platform != "darwin":
                 try:
                     resource.setrlimit(resource.RLIMIT_NPROC, (cfg.pids_limit, cfg.pids_limit))
                 except (ValueError, OSError):
