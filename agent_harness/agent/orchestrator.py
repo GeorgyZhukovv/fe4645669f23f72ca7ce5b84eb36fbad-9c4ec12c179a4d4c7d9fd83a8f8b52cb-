@@ -130,6 +130,10 @@ class Orchestrator:
                 cost_tracker=self.cost,
             )
         if self.config.llm.fallback_provider and self.config.llm.fallback_model:
+            # Don't build a fallback that uses the same provider as the primary —
+            # a quota / auth failure on one would just fail twice on the other.
+            if self.config.llm.fallback_provider == self.config.llm.provider:
+                return primary
             secondary: LLMClient
             if self.config.llm.fallback_provider == "anthropic":
                 secondary = AnthropicClient(

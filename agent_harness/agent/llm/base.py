@@ -114,6 +114,18 @@ class FallbackClient(LLMClient):
         self.primary = primary
         self.secondary = secondary
 
+    def _is_terminal_auth_error(self, exc: Exception) -> bool:
+        """Detect quota / auth errors that no fallback can recover from."""
+        msg = str(exc).lower()
+        name = type(exc).__name__.lower()
+        if "insufficient_quota" in msg or "invalid_api_key" in msg or "incorrect api key" in msg:
+            return True
+        if "authenticationerror" in name and "anthropic" in name:
+            return True
+        if "authenticationerror" in name and "openai" in name:
+            return True
+        return False
+
     async def complete(
         self,
         messages: list[LLMMessage],
@@ -124,7 +136,9 @@ class FallbackClient(LLMClient):
     ) -> LLMResponse:
         try:
             return await self.primary.complete(messages, tools, system, temperature, max_tokens)
-        except Exception:
+        except Exception as exc:
+            if self._is_terminal_auth_error(exc):
+                raise
             return await self.secondary.complete(messages, tools, system, temperature, max_tokens)
 
     async def stream(  # type: ignore[override]
@@ -138,6 +152,8 @@ class FallbackClient(LLMClient):
         try:
             async for chunk in self.primary.stream(messages, tools, system, temperature, max_tokens):
                 yield chunk
-        except Exception:
+        except Exception as exc:
+            if self._is_terminal_auth_error(exc):
+                raise
             async for chunk in self.secondary.stream(messages, tools, system, temperature, max_tokens):
                 yield chunk

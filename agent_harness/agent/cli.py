@@ -21,6 +21,31 @@ from agent.tools import default_registry
 console = Console()
 
 
+def _friendly_llm_error(exc: BaseException) -> str | None:
+    """Translate well-known LLM SDK errors into a one-line user-facing message."""
+    name = type(exc).__name__
+    msg = str(exc)
+    if "insufficient_quota" in msg or "exceeded your current quota" in msg.lower():
+        return (
+            "OpenAI returned 'insufficient_quota'. Your account has no available credit. "
+            "Add billing at https://platform.openai.com/account/billing — the API key is fine, "
+            "the wallet is empty."
+        )
+    if name == "RateLimitError" or "rate limit" in msg.lower():
+        return "Rate-limited by the provider. Wait a moment and retry, or pick a smaller model."
+    if "model_not_found" in msg or "does not exist" in msg.lower() or "no such model" in msg.lower():
+        return (
+            f"Model id rejected by the provider: {msg.splitlines()[-1][:200]}. "
+            "Set AGENT_LLM__MODEL to a real id (e.g. gpt-4o-mini, gpt-4o, gpt-4.1)."
+        )
+    if name in {"AuthenticationError", "PermissionDeniedError"} or "invalid_api_key" in msg.lower():
+        return (
+            "The API key was rejected. Re-check OPENAI_API_KEY / ANTHROPIC_API_KEY for typos "
+            "and that the key has not been revoked."
+        )
+    return None
+
+
 def _build_orchestrator(config: AgentConfig, with_ui: bool) -> tuple[Orchestrator, Any]:
     """Build an orchestrator (+ optional UI) using shared dependencies."""
     registry = default_registry()
@@ -102,11 +127,18 @@ def run(ctx: click.Context, objective: tuple[str, ...], no_ui: bool, persona: st
     orch, ui = _build_orchestrator(config, with_ui=not no_ui)
 
     async def go() -> None:
-        if ui is not None:
-            with ui:
+        try:
+            if ui is not None:
+                with ui:
+                    session = await orch.run(obj_str)
+            else:
                 session = await orch.run(obj_str)
-        else:
-            session = await orch.run(obj_str)
+        except Exception as exc:
+            friendly = _friendly_llm_error(exc)
+            if friendly:
+                console.print(f"\n[bold red]✗ {friendly}[/bold red]")
+                sys.exit(2)
+            raise
         console.print(f"[bold green]Session {session.id} → {session.outcome}[/bold green]")
         console.print(json.dumps(orch.cost.summary(), indent=2))
 
