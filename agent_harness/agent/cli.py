@@ -188,6 +188,160 @@ def history(ctx: click.Context) -> None:
     console.print(tbl)
 
 
+@main.group(help="UI utilities.")
+def ui() -> None:
+    """UI subcommands."""
+
+
+@ui.command("demo", help="Preview the tantalus UI with canned fake state (no API calls).")
+@click.option("--seconds", default=20, type=int, help="How long to render the demo for.")
+def ui_demo(seconds: int) -> None:
+    """Render the live UI with synthetic data for ``seconds`` then exit."""
+    import asyncio
+    import random
+    import time
+    import uuid
+
+    from agent.audit import AuditLog
+    from agent.llm.base import CostTracker
+    from agent.tools.multi_edit import EditOperation, EditPlan, render_plan_diff
+    from agent.types import Complexity, Memory, TaskNode, TaskStatus, ToolCall, ToolResult
+    from agent.ui.terminal import TerminalUI
+
+    async def go() -> None:
+        cost = CostTracker()
+        cost._active_model = "gpt-4o-mini"
+        audit_dir = Path(".agent_state") / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit = AuditLog(audit_dir / "demo.jsonl")
+        ui_view = TerminalUI(
+            cost_tracker=cost,
+            audit=audit,
+            token_budget=1_000_000,
+            refresh_per_second=10,
+            console=console,
+        )
+        ui_view.set_backend("docker")
+
+        # Build a fake session that looks like a real plan in progress.
+        class _Session:
+            id = "demo123"
+            objective = "Refactor @AuthService to use dependency injection and add JWT tests"
+            tasks: dict[str, TaskNode] = {}
+            order_hint: list[str] = []
+
+        sess = _Session()
+        tasks = [
+            ("t1", "Read AuthService and map its dependencies", Complexity.S, [], TaskStatus.COMPLETE, "located 3 callers in api/, ui/, batch/"),
+            ("t2", "Extract AuthService interface", Complexity.M, ["t1"], TaskStatus.COMPLETE, "created auth/interface.py"),
+            ("t3", "Wire DI container in main.py", Complexity.M, ["t2"], TaskStatus.IN_PROGRESS, ""),
+            ("t4", "Migrate JWT signing to RS256", Complexity.L, ["t2"], TaskStatus.PENDING, ""),
+            ("t5", "Add pytest suite for auth.token", Complexity.M, ["t4"], TaskStatus.PENDING, ""),
+            ("t6", "Update README + CHANGES.md", Complexity.S, ["t3", "t4", "t5"], TaskStatus.PENDING, ""),
+            ("t7", "Run security audit", Complexity.S, ["t4"], TaskStatus.FAILED, "BLOCKED: missing trufflehog binary"),
+        ]
+        for tid, desc, comp, prereqs, status, summary in tasks:
+            node = TaskNode(id=tid, description=desc, complexity=comp, prerequisites=list(prereqs))
+            node.status = status
+            node.summary = summary
+            sess.tasks[tid] = node
+            sess.order_hint.append(tid)
+        ui_view.set_session(sess)
+
+        # Seed the stream / memory / diff panels with believable content.
+        for line in [
+            "Thought: I'll start by inspecting the AuthService entry points.",
+            "Action: file_search(pattern='class AuthService')",
+            "Observation: 1 hit at auth/service.py:14",
+            "Thought: Mapping callers via the codebase index.",
+            "Action: index_callers(symbol='AuthService')",
+            "Observation: 3 callers across api/, ui/, batch/",
+        ]:
+            ui_view.on_assistant_text(line)
+
+        ui_view.on_memories([
+            Memory(id="m1", kind="decision", content="Switched from PyJWT to authlib for RS256 support last week", metadata={}, score=0.91),
+            Memory(id="m2", kind="error", content="Earlier session: trufflehog binary missing on macOS — install via brew", metadata={}, score=0.78),
+            Memory(id="m3", kind="file", content="auth/service.py defines a 200-line god class — candidate for split", metadata={}, score=0.71),
+        ])
+
+        ui_view.on_swarm_update([
+            {"role": "CODER", "status": "running", "task": "extracting AuthService interface", "tokens": 1820},
+            {"role": "REVIEWER", "status": "waiting", "task": "queued after CODER", "tokens": 0},
+            {"role": "TESTER", "status": "waiting", "task": "queued after CODER", "tokens": 0},
+            {"role": "SECURITY_AUDITOR", "status": "failed", "task": "trufflehog missing", "tokens": 412},
+        ])
+
+        plan = EditPlan(
+            description="DI container wiring",
+            operations=[
+                EditOperation(kind="overwrite", path="main.py", content="from auth.container import build_container\n\napp = build_container()\n"),
+                EditOperation(kind="create", path="auth/container.py", content="def build_container():\n    return AuthService(JwtSigner())\n"),
+            ],
+        )
+        ui_view.on_diff_preview(render_plan_diff(plan))
+
+        for evt, payload in [
+            ("session_start", {"objective": sess.objective}),
+            ("plan", {"tasks": [t.id for t in sess.tasks.values()]}),
+            ("task_start", {"id": "t1"}),
+            ("tool_call", {"name": "file_search", "ok": True, "latency_ms": 42}),
+            ("tool_call", {"name": "index_callers", "ok": True, "latency_ms": 18}),
+            ("task_end", {"id": "t1", "status": "complete"}),
+            ("review", {"task": "t2", "approve": True}),
+        ]:
+            audit.append(evt, payload)
+
+        call = ToolCall(id=uuid.uuid4().hex, name="multi_edit", arguments={"description": "wire DI container", "ops": 2})
+        ui_view.on_tool_start(call)
+
+        ui_view.on_status("running tantalus demo · no API calls being made")
+
+        with ui_view:
+            start = time.time()
+            i = 0
+            from agent.llm.base import CostEntry
+
+            while time.time() - start < seconds:
+                # Mutate state a little each tick so the UI looks alive.
+                i += 1
+                cost.entries.append(CostEntry(
+                    model="gpt-4o-mini",
+                    prompt_tokens=200 + random.randint(0, 400),
+                    completion_tokens=80 + random.randint(0, 120),
+                    cost_usd=0.0008 + random.random() * 0.0015,
+                ))
+
+                if i == 5:
+                    ui_view.on_tool_end(ToolResult(call_id=call.id, name=call.name, ok=True, output={"applied": True}, latency_ms=124.0))
+                if i == 10:
+                    sess.tasks["t3"].status = TaskStatus.COMPLETE
+                    sess.tasks["t3"].summary = "DI container live"
+                    sess.tasks["t4"].status = TaskStatus.IN_PROGRESS
+                if i == 18:
+                    sess.tasks["t4"].status = TaskStatus.COMPLETE
+                    sess.tasks["t4"].summary = "RS256 signing wired"
+                    sess.tasks["t5"].status = TaskStatus.IN_PROGRESS
+
+                ui_view.on_assistant_text(
+                    random.choice([
+                        "Thought: planning next step",
+                        "Action: code_lint(path='auth/service.py')",
+                        "Observation: 0 issues",
+                        "Thought: writing the test scaffold",
+                        "Action: file_write(path='tests/test_auth.py')",
+                        "Observation: 47 bytes written",
+                    ])
+                )
+                audit.append("tool_call", {"name": "code_lint", "ok": True, "latency_ms": random.randint(10, 90)})
+                ui_view.refresh_dag()
+                await asyncio.sleep(0.5)
+
+        console.print(f"[bold green]demo finished after {seconds}s — no API calls were made.[/bold green]")
+
+    asyncio.run(go())
+
+
 @main.group(help="Tool management.")
 def tools() -> None:
     """Tool subcommands."""
