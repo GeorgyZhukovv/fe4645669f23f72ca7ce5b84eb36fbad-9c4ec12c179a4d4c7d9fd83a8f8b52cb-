@@ -1,6 +1,108 @@
-# Agent Harness
+# Agent Harness (Tantalus)
 
 A production-grade agentic coding harness for fully autonomous software engineering.
+
+## Supported Models
+
+Switch with `/model <id>` while a session is running, or set `AGENT_LLM__MODEL=<id>` before launch. The full set is defined in `agent/llm/models.toml`.
+
+| id | provider | tier | context | tool use | vision | notes |
+| --- | --- | --- | ---: | :---: | :---: | --- |
+| claude-opus-4 | anthropic | frontier | 200k | ✓ | ✓ | highest capability |
+| claude-sonnet-4 | anthropic | strong | 200k | ✓ | ✓ | balanced default |
+| claude-haiku-4 | anthropic | fast | 200k | ✓ | ✓ | cheapest Anthropic |
+| gpt-4o | openai | frontier | 128k | ✓ | ✓ | multimodal frontier |
+| gpt-4o-mini | openai | fast | 128k | ✓ | ✓ | cheap default |
+| o3 | openai | frontier | 200k | ✓ | ✗ | reasoning, no system role |
+| o4-mini | openai | strong | 200k | ✓ | ✗ | smaller reasoning |
+| codex-mini | openai | fast | 128k | ✓ | ✗ | code-optimised |
+| gemini-2.5-pro | gemini | frontier | 1M | ✓ | ✓ | thinking mode |
+| gemini-2.5-flash | gemini | fast | 1M | ✓ | ✓ | cheap huge ctx |
+| gemini-2.0-flash | gemini | fast | 1M | ✓ | ✓ | stable Flash |
+| mistral-large | mistral | strong | 128k | ✓ | ✗ | EU frontier |
+| mistral-small | mistral | fast | 32k | ✓ | ✗ | fast + cheap |
+| codestral | mistral | fast | 32k | ✓ | ✗ | code, FIM endpoint |
+| llama-4-scout | groq | fast | 131k | ✓ | ✗ | sub-second TTFT |
+| llama-4-maverick | groq | strong | 131k | ✓ | ✗ | frontier-class Llama 4 |
+| llama-3.3-70b | groq | strong | 128k | ✓ | ✗ | reliable workhorse |
+| deepseek-r1-distill | groq | strong | 128k | ✗ | ✗ | reasoning |
+| qwen-qwq | groq | strong | 128k | ✗ | ✗ | open reasoning |
+| llama-4-scout-cerebras | cerebras | fast | 131k | ✓ | ✗ | ~2000 tok/s |
+| llama-3.3-70b-cerebras | cerebras | fast | 128k | ✓ | ✗ | extreme throughput |
+| llama-3.3-70b-together | together | strong | 128k | ✓ | ✗ | Turbo build |
+| deepseek-v3 | together | frontier | 128k | ✓ | ✗ | DeepSeek V3 MoE |
+| qwen-2.5-coder-32b | together | strong | 32k | ✓ | ✗ | code-specialised |
+| ollama-* | ollama | local | varies | varies | ✗ | autodetected from `http://localhost:11434` |
+| lmstudio-* | lmstudio | local | varies | varies | ✗ | autodetected from `http://localhost:1234` |
+| custom endpoints | custom | local | configured | ✓ | ✗ | `[[llm.custom_endpoints]]` in `.agent.toml` |
+
+Models whose required env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `TOGETHER_API_KEY`) is missing are shown but marked unavailable; `agent tools list` and `/model list` will tell you which are configured right now.
+
+## Switching Models
+
+```bash
+agent run "..." --persona strict
+# inside the session:
+/model claude-sonnet-4          # switch to a different model right now
+/model list                     # show all configured models
+/model gemini-2.5-pro           # try a 1M-context model on this task
+```
+
+The orchestrator hot-swaps the active client; the conversation context, task DAG, and audit log all stay intact. Reasoning models (`o3`, `o4-mini`, `deepseek-r1-distill`, `qwen-qwq`) are auto-wrapped by `ReasoningAdapter`, which:
+
+- Merges the system prompt into the first user message for OpenAI's `o*` models (which reject the `system` role).
+- Routes `<think>...</think>` blocks to a separate stream so they show up in the reasoning sub-panel rather than the visible answer.
+
+## Memory Architecture
+
+```
+                ┌─────────────────────────────────────┐
+                │       Working memory (RAM)          │   token-budgeted; compresses
+                │       — current LLM context          │   low-priority msgs to a summary
+                └────────────────┬────────────────────┘
+                                 │   every tool call
+                                 ▼
+                ┌─────────────────────────────────────┐
+                │       Episodic memory (SQLite)      │   FTS5 over tool calls;
+                │       — per-session, queryable       │   scoped to the session id
+                └────────────────┬────────────────────┘
+                                 │   consolidation pass
+                                 ▼
+                ┌─────────────────────────────────────┐
+                │   Semantic memory (chromadb/json)   │   facts + decisions + errors
+                │   — project- or global-scoped        │   retrieved by similarity
+                └────────────────┬────────────────────┘
+                                 │   knowledge → procedure
+                                 ▼
+                ┌─────────────────────────────────────┐
+                │  Procedural memory (SQLite, global) │   "how to" sequences extracted
+                │  — cross-project, success-weighted   │   from successful tasks
+                └─────────────────────────────────────┘
+```
+
+The consolidator (`agent/memory/consolidation.py`) runs idle-time passes:
+
+- **Distillation** — clusters recent episodic entries (same tool + outcome) into one semantic fact.
+- **Deduplication** — removes semantic entries with token-set similarity above `dedup_threshold` (default 0.9).
+- **Staleness** — entries older than `stale_horizon_seconds` (default 7 days) get a `stale=True` flag and a `⚠ stale` badge in the UI; they're still retrieved but the planner knows to verify.
+
+### Cross-project memory
+
+```toml
+[memory]
+semantic_memory_scope = "global"   # share semantic facts across all projects
+knowledge_store_scope = "global"
+# procedural memory is always global by design.
+```
+
+```bash
+agent memory search "auth refactor" --tier all      # search all four tiers
+agent memory search "..." --tier procedural         # only procedures
+agent memory export memory.tgz --scope global       # portable archive
+agent memory import memory.tgz --scope global       # restore on a new machine
+```
+
+Imports refuse any archive entry that resolves outside the target directory.
 
 ## Features
 

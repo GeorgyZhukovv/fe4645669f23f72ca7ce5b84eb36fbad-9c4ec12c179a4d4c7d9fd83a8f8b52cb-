@@ -58,6 +58,10 @@ class MemoryConfig(BaseModel):
     semantic_collection: str = "agent_default"
     episodic_db: str = "episodic.sqlite"
     working_ttl_seconds: int = 0
+    semantic_memory_scope: str = "project"  # "project" | "global"
+    knowledge_store_scope: str = "project"
+    procedural_db: str = "procedural.sqlite"
+    global_memory_dir: str = "~/.agent/global_memory"
 
 
 class UIConfig(BaseModel):

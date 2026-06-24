@@ -121,9 +121,15 @@ class CommandDispatcher:
             return f"focus next on {evt.args[0]}"
         if cmd == "model":
             if not evt.args:
-                return "usage: /model <name>"
+                return "usage: /model <name> (or /model list)"
+            if evt.args[0] == "list":
+                hook = self.hooks.get("model")
+                return hook(evt.args) if hook else "(no orchestrator attached)"
             self.state.model_override = evt.args[0]
-            return f"model override → {evt.args[0]}"
+            hook = self.hooks.get("model")
+            if hook is not None:
+                return hook(evt.args)
+            return f"model override → {evt.args[0]} (queued; will apply on next task)"
         if cmd == "budget":
             if not evt.args or not evt.args[0].isdigit():
                 return "usage: /budget <int>"

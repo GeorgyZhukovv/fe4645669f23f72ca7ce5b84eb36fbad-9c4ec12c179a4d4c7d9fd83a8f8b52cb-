@@ -365,17 +365,61 @@ def memory() -> None:
     """Memory subcommands."""
 
 
-@memory.command("search", help="Search the semantic memory store.")
+@memory.command("search", help="Search the memory tiers (semantic + episodic + procedural).")
 @click.argument("query")
 @click.option("--top", default=5)
+@click.option("--tier", default="all", type=click.Choice(["all", "semantic", "episodic", "procedural"]))
 @click.pass_context
-def memory_search(ctx: click.Context, query: str, top: int) -> None:
+def memory_search(ctx: click.Context, query: str, top: int, tier: str) -> None:
     config: AgentConfig = ctx.obj["config"]
-    state_dir = Path(config.memory.working_dir).resolve() / "semantic"
-    sem = SemanticMemory(state_dir, collection=config.memory.semantic_collection)
+    state_dir = Path(config.memory.working_dir).resolve()
+    if config.memory.semantic_memory_scope == "global":
+        sem_root = Path(config.memory.global_memory_dir).expanduser().resolve() / "semantic"
+    else:
+        sem_root = state_dir / "semantic"
+    if tier in {"all", "semantic"}:
+        sem = SemanticMemory(sem_root, collection=config.memory.semantic_collection)
+        results = sem.retrieve_relevant_memories(query, top_k=top)
+        if results:
+            tbl = Table(title=f"semantic — {query!r}")
+            tbl.add_column("score", justify="right")
+            tbl.add_column("kind")
+            tbl.add_column("content", overflow="fold")
+            for m in results:
+                tag = m.kind + (" ⚠stale" if m.metadata.get("stale") else "")
+                tbl.add_row(f"{m.score:.3f}", tag, m.content[:200])
+            console.print(tbl)
+    if tier in {"all", "procedural"}:
+        from agent.memory.procedural import ProceduralMemory
+
+        global_root = Path(config.memory.global_memory_dir).expanduser().resolve()
+        pm = ProceduralMemory(global_root / config.memory.procedural_db)
+        proc = pm.retrieve_relevant_procedure(query, min_success_rate=0.0)
+        if proc is not None:
+            tbl = Table(title=f"procedural — {query!r}")
+            tbl.add_column("rate", justify="right")
+            tbl.add_column("uses", justify="right")
+            tbl.add_column("description", overflow="fold")
+            tbl.add_row(f"{proc.success_rate:.2f}", str(proc.times_used), proc.task_description[:160])
+            console.print(tbl)
+    if tier in {"all", "episodic"}:
+        from agent.memory.episodic import EpisodicMemory
+
+        ep = EpisodicMemory(state_dir / config.memory.episodic_db, session_id="search")
+        hits = ep.search(query, limit=top)
+        if hits:
+            tbl = Table(title=f"episodic — {query!r}")
+            tbl.add_column("ok")
+            tbl.add_column("tool")
+            tbl.add_column("args", overflow="fold")
+            for h in hits:
+                tbl.add_row("✓" if h.ok else "✗", h.tool, h.args_json[:160])
+            console.print(tbl)
+    # Backwards-compat: also print the raw semantic results in the legacy format
+    sem = SemanticMemory(sem_root, collection=config.memory.semantic_collection)
     results = sem.retrieve_relevant_memories(query, top_k=top)
-    if not results:
-        console.print("[grey50](no results)[/grey50]")
+    if not results and tier == "all":
+        console.print("[grey50](no semantic results)[/grey50]")
         return
     tbl = Table(title=f"semantic search: {query!r}")
     tbl.add_column("score", justify="right")
@@ -384,6 +428,56 @@ def memory_search(ctx: click.Context, query: str, top: int) -> None:
     for m in results:
         tbl.add_row(f"{m.score:.3f}", m.kind, m.content[:200])
     console.print(tbl)
+
+
+@memory.command("export", help="Export memory tiers to a tar.gz archive.")
+@click.argument("archive", type=click.Path())
+@click.option("--scope", default="project", type=click.Choice(["project", "global"]))
+@click.pass_context
+def memory_export(ctx: click.Context, archive: str, scope: str) -> None:
+    import tarfile
+
+    config: AgentConfig = ctx.obj["config"]
+    if scope == "global":
+        root = Path(config.memory.global_memory_dir).expanduser().resolve()
+    else:
+        root = Path(config.memory.working_dir).resolve()
+    if not root.exists():
+        console.print(f"[red]nothing to export from {root}[/red]")
+        return
+    out = Path(archive)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(out, "w:gz") as tar:
+        tar.add(root, arcname=root.name)
+    console.print(f"[green]wrote {out} ({out.stat().st_size:,} bytes)[/green]")
+
+
+@memory.command("import", help="Import memory from a tar.gz archive into the local store.")
+@click.argument("archive", type=click.Path(exists=True))
+@click.option("--scope", default="project", type=click.Choice(["project", "global"]))
+@click.pass_context
+def memory_import(ctx: click.Context, archive: str, scope: str) -> None:
+    import tarfile
+
+    config: AgentConfig = ctx.obj["config"]
+    if scope == "global":
+        target = Path(config.memory.global_memory_dir).expanduser().resolve()
+    else:
+        target = Path(config.memory.working_dir).resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        # Safe-extract: refuse any entry whose path escapes the target.
+        members = []
+        for m in tar.getmembers():
+            full = (target / m.name).resolve()
+            try:
+                full.relative_to(target)
+            except ValueError:
+                console.print(f"[red]skipping unsafe entry: {m.name}[/red]")
+                continue
+            members.append(m)
+        tar.extractall(target, members=members)
+    console.print(f"[green]imported into {target}[/green]")
 
 
 @main.command(help="Show cost and token breakdown for the most recent session.")

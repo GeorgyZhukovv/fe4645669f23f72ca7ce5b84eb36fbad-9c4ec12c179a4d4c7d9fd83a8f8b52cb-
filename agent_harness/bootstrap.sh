@@ -25,6 +25,25 @@ pip install --upgrade pip >/dev/null
 echo "[bootstrap] installing agent_harness (editable, dev extras)"
 pip install -e ".[dev]"
 
+echo "[bootstrap] sanity: model provider availability"
+python -c "
+from agent.llm.registry import ModelRegistry
+r = ModelRegistry.instance()
+r.print_availability_summary()
+"
+
+echo "[bootstrap] sanity: ollama / lm studio detection"
+if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+    echo "  ✓ ollama running"
+else
+    echo "  ✗ ollama not detected (start with: ollama serve)"
+fi
+if curl -sf http://localhost:1234/v1/models >/dev/null 2>&1; then
+    echo "  ✓ lm studio running"
+else
+    echo "  ✗ lm studio not detected"
+fi
+
 echo "[bootstrap] sanity: build the codebase index against this project"
 python -c "
 from agent.indexer import build_index, save_index

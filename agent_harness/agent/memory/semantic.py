@@ -151,7 +151,8 @@ class SemanticMemory:
     ) -> str:
         """Add a new memory and return its id."""
         meta = dict(metadata or {})
-        meta.update({"kind": kind, "ts": time.time()})
+        meta["kind"] = kind
+        meta.setdefault("ts", time.time())
         if self._chroma_collection is not None:
             rec_id = str(uuid.uuid4())
             self._chroma_collection.add(ids=[rec_id], documents=[content], metadatas=[meta])

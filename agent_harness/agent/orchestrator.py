@@ -19,6 +19,8 @@ from agent.context import ContextManager
 from agent.llm.anthropic_client import AnthropicClient
 from agent.llm.base import CostTracker, LLMClient
 from agent.llm.openai_client import OpenAIClient
+from agent.llm.reasoning import maybe_wrap_reasoning
+from agent.llm.registry import ModelRegistry, ModelSpec
 from agent.loop import AgentLoop, LoopResult
 from agent.prompts.planner import build_planner_prompt
 from agent.prompts.reflector import COMPRESSION_PROMPT, REFLECTOR_PROMPT
@@ -152,6 +154,39 @@ class Orchestrator:
         return primary
 
     # -------- Session lifecycle --------
+
+    def switch_model(self, model_id: str) -> tuple[bool, str]:
+        """Hot-swap the active LLM client to a new model.
+
+        Args:
+            model_id: A model id registered in ``models.toml`` (or auto-detected).
+
+        Returns:
+            ``(ok, message)`` — ``ok=False`` means the switch was rejected and the
+            previous client is still active.
+        """
+        registry = ModelRegistry.instance()
+        spec = registry.get(model_id)
+        if spec is None:
+            return False, f"unknown model id: {model_id}"
+        if not spec.available:
+            return False, f"model {model_id} is registered but its provider credentials are missing"
+        try:
+            new_client = registry.build_client(model_id, cost_tracker=self.cost)
+        except Exception as exc:
+            return False, f"failed to build client for {model_id}: {exc}"
+        new_client = maybe_wrap_reasoning(
+            new_client, model_id, no_system_prompt=spec.no_system_prompt,
+        )
+        previous = getattr(self.llm, "model", "?")
+        self.llm = new_client
+        self.config.llm.model = spec.api_model_name
+        self.config.llm.provider = spec.provider
+        if self.events is not None:
+            self.events.helper("user_command", command="model", args=[model_id], previous=previous)
+        if self.audit is not None:
+            self.audit.append("model_switch", {"from": previous, "to": model_id, "spec": spec.as_dict()})
+        return True, f"switched {previous} → {model_id}"
 
     def _state_dir(self) -> Path:
         return Path(self.config.memory.working_dir).resolve()
@@ -499,6 +534,20 @@ class Orchestrator:
 
         if loop_result.completed and ok:
             task.status = TaskStatus.COMPLETE
+            try:
+                from agent.memory.procedural import ProcedureStep
+
+                steps = [
+                    ProcedureStep(tool=r.name, args_summary=str(r.output)[:120], ok=r.ok)
+                    for r in loop_result.tool_results
+                ]
+                duration = sum(r.latency_ms for r in loop_result.tool_results)
+                self.context.procedural.record_successful_procedure(
+                    task.description, steps, duration_ms=duration,
+                    session_id=self.session.id if self.session else "",
+                )
+            except Exception:
+                pass
         elif loop_result.blocked:
             task.status = TaskStatus.FAILED
             task.error = loop_result.summary

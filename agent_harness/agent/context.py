@@ -7,18 +7,25 @@ from pathlib import Path
 
 from agent.config import AgentConfig
 from agent.memory.episodic import EpisodicMemory
+from agent.memory.procedural import ProceduralMemory
 from agent.memory.semantic import SemanticMemory
 from agent.memory.working import KVStore, WorkingMemory
 from agent.types import LLMMessage, Memory
 
 
+def _global_root(config: AgentConfig) -> Path:
+    """Expand the configured global-memory dir to an absolute path."""
+    return Path(config.memory.global_memory_dir).expanduser().resolve()
+
+
 @dataclass
 class ContextManager:
-    """Glue class wiring the three memory tiers and exposing them to the loop."""
+    """Glue class wiring the four memory tiers and exposing them to the loop."""
 
     working: WorkingMemory
     episodic: EpisodicMemory
     semantic: SemanticMemory
+    procedural: ProceduralMemory
     kv: KVStore
     state_dir: Path
 
@@ -27,11 +34,25 @@ class ContextManager:
         """Build a :class:`ContextManager` from the loaded :class:`AgentConfig`."""
         state_dir = Path(config.memory.working_dir).resolve()
         state_dir.mkdir(parents=True, exist_ok=True)
-        episodic = EpisodicMemory(state_dir / config.memory.episodic_db, session_id=session_id)
-        semantic = SemanticMemory(state_dir / "semantic", collection=config.memory.semantic_collection)
+        global_root = _global_root(config)
+        global_root.mkdir(parents=True, exist_ok=True)
+
+        episodic_path = state_dir / config.memory.episodic_db
+        if config.memory.semantic_memory_scope == "global":
+            semantic_root = global_root / "semantic"
+        else:
+            semantic_root = state_dir / "semantic"
+        proc_path = global_root / config.memory.procedural_db
+
+        episodic = EpisodicMemory(episodic_path, session_id=session_id)
+        semantic = SemanticMemory(semantic_root, collection=config.memory.semantic_collection)
+        procedural = ProceduralMemory(proc_path)
         working = WorkingMemory(budget_tokens=config.budget.context_token_limit, model=config.llm.model)
         kv = KVStore(state_dir / "kv.sqlite")
-        return cls(working=working, episodic=episodic, semantic=semantic, kv=kv, state_dir=state_dir)
+        return cls(
+            working=working, episodic=episodic, semantic=semantic,
+            procedural=procedural, kv=kv, state_dir=state_dir,
+        )
 
     def system(self, content: str) -> None:
         """Push a system message onto working memory."""
