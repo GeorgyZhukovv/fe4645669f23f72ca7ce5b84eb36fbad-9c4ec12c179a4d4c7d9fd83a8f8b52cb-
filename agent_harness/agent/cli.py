@@ -696,6 +696,20 @@ def prompt_eval(ctx: click.Context, objective: tuple[str, ...], variants: str) -
     asyncio.run(go())
 
 
+@main.command(
+    "mcp",
+    help=(
+        "Run as an MCP (Model Context Protocol) server over stdio. "
+        "Point Cursor / Claude Desktop / Cody at this to expose the harness's tools."
+    ),
+)
+def mcp_serve() -> None:
+    """Run the MCP server on stdin/stdout."""
+    from agent.mcp.server import serve_stdio
+
+    asyncio.run(serve_stdio())
+
+
 def cli_entry() -> None:
     """Console-script entry point."""
     main(obj={})
