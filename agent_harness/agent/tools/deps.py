@@ -370,15 +370,44 @@ async def _osv_query(packages: list[PackageInfo], ecosystem: EcoSystem) -> list[
                         severity = "critical"
                     elif score.startswith("7") or score.startswith("8"):
                         severity = "high"
+                fixed = _osv_fixed_version(v)
                 findings.append(Vulnerability(
                     package=pkg.name,
                     installed_version=pkg.version,
-                    fixed_version=None,
+                    fixed_version=fixed,
                     severity=_normalize_severity(severity),
                     cve_ids=v.get("aliases", []) or [v.get("id", "")],
                     description=v.get("summary", "")[:1000],
+                    remediation=f"upgrade to {fixed}" if fixed else "",
                 ))
     return findings
+
+
+def _osv_fixed_version(advisory: dict[str, Any]) -> str | None:
+    """Walk an OSV ``vulns[i].affected[*].ranges[*].events[*]`` tree for the highest fixed version."""
+    candidates: list[str] = []
+    for affected in advisory.get("affected", []) or []:
+        for rng in affected.get("ranges", []) or []:
+            for evt in rng.get("events", []) or []:
+                fix = evt.get("fixed")
+                if fix:
+                    candidates.append(str(fix))
+    if not candidates:
+        return None
+    # Pick the lexicographically-highest version string. Imperfect but good
+    # enough for a planner that the user will preview before applying.
+    return sorted(candidates, key=_parse_version_key)[-1]
+
+
+def _parse_version_key(v: str) -> tuple:
+    """Coarse version parser: turn ``"1.10.2"`` into a tuple for sort comparison."""
+    parts = []
+    for chunk in v.split("."):
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
 
 
 async def _npm_audit(root: Path) -> list[Vulnerability]:
@@ -536,7 +565,23 @@ def upgrade_plan_to_edit_plan(
                     new,
                     flags=re.MULTILINE,
                 )
-            ops.append({"kind": "overwrite", "path": str(req), "content": new})
+            if new != text:
+                ops.append({"kind": "overwrite", "path": str(req), "content": new})
+        # pyproject.toml: rewrite version specifiers in both `dependencies` lists
+        # and any `[project.optional-dependencies]` table.
+        pyp = root / "pyproject.toml"
+        if pyp.exists():
+            text = pyp.read_text(encoding="utf-8", errors="replace")
+            new = text
+            for prop in upgrade.proposals:
+                # match e.g. "aiohttp>=3.9.0" or "markdownify==0.13.0"
+                new = re.sub(
+                    rf'(["\']){re.escape(prop.package)}(\[[^\]]*\])?\s*(?:[<>=!~][^"\']+)?\1',
+                    lambda m, p=prop: f'{m.group(1)}{p.package}{m.group(2) or ""}>={p.target_version}{m.group(1)}',
+                    new,
+                )
+            if new != text:
+                ops.append({"kind": "overwrite", "path": str(pyp), "content": new})
     elif ecosystem == "node":
         pj = root / "package.json"
         if pj.exists():

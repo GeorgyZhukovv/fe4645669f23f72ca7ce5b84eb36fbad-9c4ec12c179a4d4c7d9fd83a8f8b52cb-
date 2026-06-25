@@ -179,17 +179,36 @@ async def test_runner(path: str = ".", framework: str = "pytest", filter: str | 
             cmd += ["-k", filter]
         code, out, err = await _run(cmd, timeout=600)
         passed = failed = errors = skipped = 0
+        # Pytest summary line looks like: "==== 153 passed, 2 warnings in 7.11s ===="
+        # In pytest 9 the column counts include warning info. Pull every "<n> <kw>"
+        # pair with a regex so we're robust across pytest versions.
+        import re as _re
         for line in out.splitlines():
-            if "passed" in line or "failed" in line:
-                for token in line.split():
-                    if token.endswith("passed"):
-                        passed = int(token[:-6]) if token[:-6].isdigit() else passed
-                    elif token.endswith("failed"):
-                        failed = int(token[:-6]) if token[:-6].isdigit() else failed
-                    elif token.endswith("error") or token.endswith("errors"):
-                        suffix = "errors" if token.endswith("errors") else "error"
-                        errors = int(token[: -len(suffix)]) if token[: -len(suffix)].isdigit() else errors
-                    elif token.endswith("skipped"):
+            stripped = line.strip().strip("=").strip()
+            if not stripped or ("passed" not in stripped and "failed" not in stripped
+                                and "error" not in stripped and "skipped" not in stripped):
+                continue
+            for m in _re.finditer(r"(\d+)\s+(passed|failed|errors?|skipped)", stripped):
+                count = int(m.group(1))
+                kw = m.group(2)
+                if kw == "passed":
+                    passed = count
+                elif kw == "failed":
+                    failed = count
+                elif kw.startswith("error"):
+                    errors = count
+                elif kw == "skipped":
+                    skipped = count
+            # Also match the simple legacy "<n> <keyword>" tokens for backwards compat.
+            for token in stripped.split():
+                if token.endswith("passed") and not passed:
+                    passed = int(token[:-6]) if token[:-6].isdigit() else passed
+                elif token.endswith("failed") and not failed:
+                    failed = int(token[:-6]) if token[:-6].isdigit() else failed
+                elif token.endswith(("error", "errors")) and not errors:
+                    suffix = "errors" if token.endswith("errors") else "error"
+                    errors = int(token[: -len(suffix)]) if token[: -len(suffix)].isdigit() else errors
+                elif token.endswith("skipped") and not skipped:
                         skipped = int(token[:-7]) if token[:-7].isdigit() else skipped
         failures = _extract_pytest_failures(out)
         report = TestReport(

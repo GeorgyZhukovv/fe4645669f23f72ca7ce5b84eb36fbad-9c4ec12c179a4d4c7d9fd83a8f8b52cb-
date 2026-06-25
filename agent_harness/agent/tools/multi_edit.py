@@ -261,13 +261,42 @@ async def multi_edit(
 
     Args:
         description: Short human-readable summary.
-        operations: List of dicts with ``kind`` and operation-specific keys.
-        verification_commands: Optional list of shell commands run after all ops succeed.
+        operations: List of dicts with ``kind`` and operation-specific keys, or a
+            JSON-encoded string of the same (auto-decoded when callers — e.g. an
+            MCP client — pass the value as text).
+        verification_commands: Optional list of shell commands run after all ops
+            succeed. Also accepts a JSON-encoded string.
 
     Returns:
         A dict-ified :class:`EditResult` with status and per-op artifacts.
     """
-    ops = [EditOperation(**op) for op in operations]
+    import json as _json
+
+    if isinstance(operations, str):
+        try:
+            operations = _json.loads(operations)
+        except _json.JSONDecodeError as exc:
+            return {
+                "edit_id": "",
+                "status": "failed",
+                "applied_ops": [],
+                "verification_outputs": [],
+                "error": f"operations was a string but not valid JSON: {exc}",
+            }
+    if isinstance(verification_commands, str):
+        try:
+            verification_commands = _json.loads(verification_commands)
+        except _json.JSONDecodeError:
+            verification_commands = [verification_commands]
+    if not isinstance(operations, list):
+        return {
+            "edit_id": "",
+            "status": "failed",
+            "applied_ops": [],
+            "verification_outputs": [],
+            "error": f"operations must be a list, got {type(operations).__name__}",
+        }
+    ops = [EditOperation(**op) if isinstance(op, dict) else EditOperation(**_json.loads(op)) for op in operations]
     plan = EditPlan(
         description=description,
         operations=ops,
