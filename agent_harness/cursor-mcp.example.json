@@ -1,0 +1,15 @@
+{
+  "_comment": "Drop this into ~/.cursor/mcp.json (global) or .cursor/mcp.json (workspace).",
+  "_comment2": "Replace the command path with the absolute path to the `agent` console script in your venv.",
+  "mcpServers": {
+    "tantalus": {
+      "command": "/Users/REPLACE_ME/Downloads/agent_harness/.venv/bin/agent",
+      "args": ["mcp"],
+      "env": {
+        "AGENT_LLM__PROVIDER": "anthropic",
+        "AGENT_LLM__MODEL": "claude-sonnet-4",
+        "ANTHROPIC_API_KEY": "OPTIONAL_set_in_shell_instead"
+      }
+    }
+  }
+}

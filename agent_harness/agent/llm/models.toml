@@ -1,0 +1,357 @@
+# Tantalus model registry — every entry the harness knows about.
+# `id` is the string used with `/model`. `api_model_name` is what gets sent to the provider.
+
+# ---------- Anthropic ----------
+
+[[anthropic]]
+id = "claude-opus-4"
+provider = "anthropic"
+api_model_name = "claude-opus-4-8"
+context_window_tokens = 200000
+input_cost_per_million = 15.0
+output_cost_per_million = 75.0
+supports_tool_use = true
+supports_vision = true
+supports_streaming = true
+tier = "frontier"
+notes = "Highest-capability Anthropic model. Best for complex multi-step engineering."
+
+[[anthropic]]
+id = "claude-sonnet-4"
+provider = "anthropic"
+api_model_name = "claude-sonnet-4-6"
+context_window_tokens = 200000
+input_cost_per_million = 3.0
+output_cost_per_million = 15.0
+supports_tool_use = true
+supports_vision = true
+supports_streaming = true
+tier = "strong"
+notes = "Strong default — great cost/quality balance for most coding work."
+
+[[anthropic]]
+id = "claude-haiku-4"
+provider = "anthropic"
+api_model_name = "claude-haiku-4-5-20251001"
+context_window_tokens = 200000
+input_cost_per_million = 1.0
+output_cost_per_million = 5.0
+supports_tool_use = true
+supports_vision = true
+supports_streaming = true
+tier = "fast"
+notes = "Cheapest Anthropic model. Use for high-volume / latency-sensitive paths."
+
+# ---------- OpenAI ----------
+
+[[openai]]
+id = "gpt-4o"
+provider = "openai"
+api_model_name = "gpt-4o"
+context_window_tokens = 128000
+input_cost_per_million = 5.0
+output_cost_per_million = 15.0
+supports_tool_use = true
+supports_vision = true
+supports_streaming = true
+tier = "frontier"
+notes = "Multimodal frontier model."
+
+[[openai]]
+id = "gpt-4o-mini"
+provider = "openai"
+api_model_name = "gpt-4o-mini"
+context_window_tokens = 128000
+input_cost_per_million = 0.15
+output_cost_per_million = 0.6
+supports_tool_use = true
+supports_vision = true
+supports_streaming = true
+tier = "fast"
+notes = "Cheap default. Sufficient for routine refactors."
+
+[[openai]]
+id = "o3"
+provider = "openai"
+api_model_name = "o3"
+context_window_tokens = 200000
+input_cost_per_million = 10.0
+output_cost_per_million = 40.0
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "frontier"
+reasoning = true
+no_system_prompt = true
+notes = "Reasoning model. No system role — merged into first user msg. Strong on hard logic."
+
+[[openai]]
+id = "o4-mini"
+provider = "openai"
+api_model_name = "o4-mini"
+context_window_tokens = 200000
+input_cost_per_million = 3.0
+output_cost_per_million = 12.0
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "strong"
+reasoning = true
+no_system_prompt = true
+notes = "Smaller, cheaper reasoning model."
+
+[[openai]]
+id = "codex-mini"
+provider = "openai"
+api_model_name = "codex-mini-latest"
+context_window_tokens = 128000
+input_cost_per_million = 1.5
+output_cost_per_million = 6.0
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "fast"
+notes = "Code-optimised. Good for narrow refactors / lint-fix loops."
+
+# ---------- Google Gemini ----------
+
+[[gemini]]
+id = "gemini-2.5-pro"
+provider = "gemini"
+api_model_name = "gemini-2.5-pro-preview"
+context_window_tokens = 1000000
+input_cost_per_million = 1.25
+output_cost_per_million = 10.0
+supports_tool_use = true
+supports_vision = true
+supports_streaming = true
+tier = "frontier"
+notes = "1M context, optional thinking mode."
+
+[[gemini]]
+id = "gemini-2.5-flash"
+provider = "gemini"
+api_model_name = "gemini-2.5-flash-preview"
+context_window_tokens = 1000000
+input_cost_per_million = 0.075
+output_cost_per_million = 0.3
+supports_tool_use = true
+supports_vision = true
+supports_streaming = true
+tier = "fast"
+notes = "Cheap + huge ctx. Great for whole-repo passes."
+
+[[gemini]]
+id = "gemini-2.0-flash"
+provider = "gemini"
+api_model_name = "gemini-2.0-flash"
+context_window_tokens = 1000000
+input_cost_per_million = 0.075
+output_cost_per_million = 0.3
+supports_tool_use = true
+supports_vision = true
+supports_streaming = true
+tier = "fast"
+notes = "Stable previous-gen Flash."
+
+# ---------- Mistral ----------
+
+[[mistral]]
+id = "mistral-large"
+provider = "mistral"
+api_model_name = "mistral-large-latest"
+context_window_tokens = 128000
+input_cost_per_million = 2.0
+output_cost_per_million = 6.0
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "strong"
+notes = "European frontier model."
+
+[[mistral]]
+id = "mistral-small"
+provider = "mistral"
+api_model_name = "mistral-small-latest"
+context_window_tokens = 32000
+input_cost_per_million = 0.2
+output_cost_per_million = 0.6
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "fast"
+notes = "Fast and cheap."
+
+[[mistral]]
+id = "codestral"
+provider = "mistral"
+api_model_name = "codestral-latest"
+context_window_tokens = 32000
+input_cost_per_million = 0.2
+output_cost_per_million = 0.6
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "fast"
+fim = true
+notes = "Code-specialised. Fill-in-the-middle endpoint."
+
+# ---------- Groq (OpenAI-compatible) ----------
+
+[[groq]]
+id = "llama-4-scout"
+provider = "groq"
+api_model_name = "meta-llama/llama-4-scout-17b-16e-instruct"
+context_window_tokens = 131072
+input_cost_per_million = 0.18
+output_cost_per_million = 0.59
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "fast"
+notes = "Llama 4 small variant on Groq's silicon — sub-second TTFT."
+
+[[groq]]
+id = "llama-4-maverick"
+provider = "groq"
+api_model_name = "meta-llama/llama-4-maverick-17b-128e-instruct"
+context_window_tokens = 131072
+input_cost_per_million = 0.5
+output_cost_per_million = 0.77
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "strong"
+notes = "Llama 4 frontier-class on Groq."
+
+[[groq]]
+id = "llama-3.3-70b"
+provider = "groq"
+api_model_name = "llama-3.3-70b-versatile"
+context_window_tokens = 128000
+input_cost_per_million = 0.59
+output_cost_per_million = 0.79
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "strong"
+notes = "Llama 3.3 70B. Reliable workhorse."
+
+[[groq]]
+id = "deepseek-r1-distill"
+provider = "groq"
+api_model_name = "deepseek-r1-distill-llama-70b"
+context_window_tokens = 128000
+input_cost_per_million = 0.75
+output_cost_per_million = 0.99
+supports_tool_use = false
+supports_vision = false
+supports_streaming = true
+tier = "strong"
+reasoning = true
+notes = "Reasoning. <think> blocks routed to reasoning panel."
+
+[[groq]]
+id = "qwen-qwq"
+provider = "groq"
+api_model_name = "qwen-qwq-32b"
+context_window_tokens = 128000
+input_cost_per_million = 0.29
+output_cost_per_million = 0.39
+supports_tool_use = false
+supports_vision = false
+supports_streaming = true
+tier = "strong"
+reasoning = true
+notes = "Open reasoning model from Qwen."
+
+# ---------- Cerebras (OpenAI-compatible) ----------
+
+[[cerebras]]
+id = "llama-4-scout-cerebras"
+provider = "cerebras"
+api_model_name = "llama4-scout-17b-16e"
+context_window_tokens = 131072
+input_cost_per_million = 0.65
+output_cost_per_million = 0.85
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "fast"
+notes = "Cerebras inference — ~2000 tok/s."
+
+[[cerebras]]
+id = "llama-3.3-70b-cerebras"
+provider = "cerebras"
+api_model_name = "llama-3.3-70b"
+context_window_tokens = 128000
+input_cost_per_million = 0.85
+output_cost_per_million = 1.2
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "fast"
+notes = "Llama 3.3 70B on Cerebras silicon."
+
+# ---------- Together AI (OpenAI-compatible) ----------
+
+[[together]]
+id = "llama-3.3-70b-together"
+provider = "together"
+api_model_name = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+context_window_tokens = 128000
+input_cost_per_million = 0.88
+output_cost_per_million = 0.88
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "strong"
+notes = "Together's Turbo build of Llama 3.3."
+
+[[together]]
+id = "deepseek-v3"
+provider = "together"
+api_model_name = "deepseek-ai/DeepSeek-V3"
+context_window_tokens = 128000
+input_cost_per_million = 1.25
+output_cost_per_million = 1.25
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "frontier"
+notes = "DeepSeek V3 frontier MoE."
+
+[[together]]
+id = "qwen-2.5-coder-32b"
+provider = "together"
+api_model_name = "Qwen/Qwen2.5-Coder-32B-Instruct"
+context_window_tokens = 32000
+input_cost_per_million = 0.8
+output_cost_per_million = 0.8
+supports_tool_use = true
+supports_vision = false
+supports_streaming = true
+tier = "strong"
+notes = "Code-specialised Qwen 2.5."
+
+# ---------- Local backends ----------
+
+[[local_autodetect]]
+id = "ollama-auto"
+provider = "ollama"
+base_url = "http://localhost:11434/v1"
+list_endpoint = "http://localhost:11434/api/tags"
+list_key = "models"
+list_name_key = "name"
+prefix = "ollama-"
+tier = "local"
+
+[[local_autodetect]]
+id = "lmstudio-auto"
+provider = "lmstudio"
+base_url = "http://localhost:1234/v1"
+list_endpoint = "http://localhost:1234/v1/models"
+list_key = "data"
+list_name_key = "id"
+prefix = "lmstudio-"
+tier = "local"
