@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pickle
 import re
 import time
@@ -119,12 +120,25 @@ class Orchestrator:
 
         primary: LLMClient
         if self.config.llm.provider == "anthropic":
+            if not (self.config.llm.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")):
+                raise RuntimeError(
+                    "No ANTHROPIC_API_KEY set. Either export ANTHROPIC_API_KEY, or set "
+                    "AGENT_LLM__PROVIDER to a provider whose key is configured "
+                    "(openai / gemini / groq / cerebras / together / mistral / ollama)."
+                )
             primary = AnthropicClient(
                 model=self.config.llm.model,
                 api_key=self.config.llm.anthropic_api_key,
                 cost_tracker=self.cost,
             )
         else:
+            if self.config.llm.provider == "openai" and not (
+                self.config.llm.openai_api_key or os.environ.get("OPENAI_API_KEY")
+            ):
+                raise RuntimeError(
+                    "No OPENAI_API_KEY set. Either export OPENAI_API_KEY, or set "
+                    "AGENT_LLM__PROVIDER to a provider whose key is configured."
+                )
             primary = OpenAIClient(
                 model=self.config.llm.model,
                 api_key=self.config.llm.openai_api_key,
@@ -135,6 +149,9 @@ class Orchestrator:
             # Don't build a fallback that uses the same provider as the primary —
             # a quota / auth failure on one would just fail twice on the other.
             if self.config.llm.fallback_provider == self.config.llm.provider:
+                return primary
+            # Skip the fallback if its provider has no credentials configured.
+            if not _provider_credentials_present(self.config.llm.fallback_provider, self.config.llm):
                 return primary
             secondary: LLMClient
             if self.config.llm.fallback_provider == "anthropic":
@@ -745,6 +762,30 @@ def _strict_json_extract(text: str) -> dict[str, Any]:
 def assess_command(command: str) -> dict[str, Any]:
     """Public helper used by the CLI confirmation hook."""
     return {"destructive": is_destructive(command), "command": command}
+
+
+_PROVIDER_ENV = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "cerebras": "CEREBRAS_API_KEY",
+    "together": "TOGETHER_API_KEY",
+}
+
+
+def _provider_credentials_present(provider: str, llm_cfg: Any) -> bool:
+    """Return True if the given provider has a key configured (env or config field)."""
+    if provider in {"ollama", "lmstudio", "custom"}:
+        return True
+    env_name = _PROVIDER_ENV.get(provider)
+    if env_name and os.environ.get(env_name):
+        return True
+    field = {"anthropic": "anthropic_api_key", "openai": "openai_api_key"}.get(provider)
+    if field and getattr(llm_cfg, field, None):
+        return True
+    return False
 
 
 __all__ = ["Orchestrator", "Session", "assess_command"]
